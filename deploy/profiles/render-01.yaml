@@ -1,0 +1,12 @@
+# Desk-side render box: consumer cards, no ECC, runs hot under a desk.
+hostname: render-01
+cores: 16
+ram_gb: 64
+scratch_gb: 1000
+pcie_gen: 4
+driver: "550.54"
+cuda: "12.4"
+labels: { location: lab-b, owner_team: render }
+devices:
+  - { vram_gb: 24, model: "sim-consumer-24", compute_capability: "8.6", encode_sessions: 3, decode_sessions: 3, ecc_present: false, idle_temp_c: 48, temp_under_load_c: 84, power_w: 450 }
+  - { vram_gb: 24, model: "sim-consumer-24", compute_capability: "8.6", encode_sessions: 3, decode_sessions: 3, ecc_present: false, idle_temp_c: 50, temp_under_load_c: 86, power_w: 450 }

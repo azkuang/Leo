@@ -1,0 +1,12 @@
+# CAD workstation: professional cards, ECC, racked and well cooled.
+hostname: cad-01
+cores: 32
+ram_gb: 256
+scratch_gb: 2000
+pcie_gen: 5
+driver: "580.95"
+cuda: "13.0"
+labels: { location: lab-a, owner_team: cad }
+devices:
+  - { vram_gb: 48, model: "sim-pro-48", compute_capability: "8.9", encode_sessions: 8, decode_sessions: 8, ecc_present: true, idle_temp_c: 35, temp_under_load_c: 68, power_w: 300 }
+  - { vram_gb: 48, model: "sim-pro-48", compute_capability: "8.9", encode_sessions: 8, decode_sessions: 8, ecc_present: true, idle_temp_c: 35, temp_under_load_c: 68, power_w: 300 }

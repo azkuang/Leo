@@ -1,0 +1,36 @@
+# Node agent unit.
+#
+# Install with deploy/install-agent.sh, which drops the binary in place, writes
+# the token to an environment file readable only by root, and enables this.
+#
+# Restart=always is the whole failure story for a node: workstations get
+# rebooted, slept and unplugged, and the agent rejoining is routine rather than
+# an incident. The control plane frees the lapsed leases either way.
+
+[Unit]
+Description=orch node agent
+After=network-online.target containerd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/orch/agent.env
+ExecStart=/usr/local/bin/orchd-agent \
+    --server=${ORCH_SERVER} \
+    --cache-dir=/var/lib/orch/cache \
+    --labels=${ORCH_LABELS}
+Restart=always
+RestartSec=5
+
+StateDirectory=orch
+# The content-addressed cache is the only state worth keeping across restarts,
+# and re-downloading is always safe, so nothing here is precious.
+WorkingDirectory=/var/lib/orch
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

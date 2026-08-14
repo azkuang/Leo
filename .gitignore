@@ -1,0 +1,9 @@
+# Build output
+/bin/
+/internal/ui/dist/
+/web/node_modules/
+/web/.render-check.bundle.mjs
+/web/shot.mjs
+
+# Local run state
+/.run/

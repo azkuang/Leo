@@ -1,0 +1,66 @@
+# Control plane only.
+#
+# Agents are not containers here: they need the host's devices, driver and
+# container runtime, so they install as systemd units on the machines
+# themselves. The control plane is the part that is identical everywhere and so
+# the part worth packaging.
+
+name: orch
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orch
+      POSTGRES_PASSWORD: orch
+      POSTGRES_DB: orch
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # orchd waits for the database itself, but a healthcheck means
+      # `docker compose up` reports the real story while it starts.
+      test: ["CMD-SHELL", "pg_isready -U orch -d orch"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "5432:5432"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: orch
+      MINIO_ROOT_PASSWORD: orchorch
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports:
+      # Inputs and results move directly between clients, agents and this
+      # bucket. The control plane never sees a payload.
+      - "9000:9000"
+      - "9001:9001"
+
+  orchd:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    environment:
+      ORCH_DSN: postgres://orch:orch@postgres:5432/orch?sslmode=disable
+      ORCH_LISTEN: ":9443"
+      ORCH_LOG_LEVEL: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      # Agents, API clients and the UI all arrive here. One port, because the
+      # UI is embedded in the binary.
+      - "9443:9443"
+
+volumes:
+  pgdata:
+  miniodata:

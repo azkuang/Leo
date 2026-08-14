@@ -1,0 +1,66 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    color-scheme: dark;
+  }
+
+  body {
+    @apply bg-ground text-ink font-sans antialiased;
+    /* A faint grid, like a mimic panel behind the instruments. Low enough
+       contrast that it reads as texture rather than as data. */
+    background-image:
+      linear-gradient(rgba(46, 55, 99, 0.16) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(46, 55, 99, 0.16) 1px, transparent 1px);
+    background-size: 32px 32px;
+  }
+
+  :focus-visible {
+    @apply outline-none ring-2 ring-pool-1 ring-offset-2 ring-offset-ground;
+  }
+}
+
+@layer components {
+  /* Every label on this page is a panel legend: small, uppercase, spaced. */
+  .legend {
+    @apply text-micro uppercase tracking-[0.14em] text-dim font-mono;
+  }
+
+  .panel {
+    @apply bg-panel border border-hairline rounded-sm;
+  }
+
+  .readout {
+    @apply font-mono tabular-nums;
+  }
+
+  .btn {
+    @apply px-3 py-1.5 text-tiny font-mono rounded-sm border border-hairline
+           bg-raised text-ink transition-colors
+           hover:border-pool-1 hover:text-pool-1
+           disabled:opacity-40 disabled:cursor-not-allowed
+           disabled:hover:border-hairline disabled:hover:text-ink;
+  }
+
+  .btn-alarm {
+    @apply hover:border-heat-hot hover:text-heat-hot;
+  }
+
+  .field {
+    @apply w-full bg-ground border border-hairline rounded-sm px-2 py-1.5
+           text-tiny font-mono text-ink placeholder:text-dim
+           focus:border-pool-1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

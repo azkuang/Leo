@@ -1,0 +1,533 @@
+syntax = "proto3";
+
+package orch.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/alexk/orch/gen/orch/v1;orchv1";
+
+// ---------------------------------------------------------------------------
+// Capability document (§6)
+//
+// The portability contract. An agent self-reports; the scheduler consumes it
+// generically. Type names are vendor-neutral on purpose -- `Device`, not
+// `NvidiaGPU`. The scheduler contains no list of GPU models; every filter is a
+// capability predicate over these fields.
+// ---------------------------------------------------------------------------
+
+message Device {
+  uint32 index = 1;
+  string vendor = 2;
+  // Informational only. Never read by the scheduler.
+  string model = 3;
+  uint32 vram_gb = 4;
+  // Lexical "major.minor", compared numerically by the filter layer.
+  string compute_capability = 5;
+  bool mig_capable = 6;
+  string mig_profile = 7;
+  uint32 encode_sessions = 8;
+  uint32 decode_sessions = 9;
+  bool ecc_present = 10;
+}
+
+message HostSpec {
+  uint32 cores = 1;
+  uint32 ram_gb = 2;
+  uint32 scratch_gb = 3;
+  uint32 pcie_gen = 4;
+}
+
+message SoftwareSpec {
+  string driver = 1;
+  string cuda = 2;
+  string runtime = 3;
+}
+
+message CapabilityDoc {
+  repeated Device devices = 1;
+  HostSpec host = 2;
+  SoftwareSpec software = 3;
+  map<string, string> labels = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Health (§9)
+// ---------------------------------------------------------------------------
+
+// Universal signals are always populated. ECC and row-remapping are present on
+// professional cards and absent on GeForce, so they are gated behind
+// `ecc_supported` and must never be assumed.
+message HealthSample {
+  uint32 device_index = 1;
+  double utilization = 2;
+  uint32 free_vram_gb = 3;
+  double temperature_c = 4;
+  double power_w = 5;
+  // Distinguishes "slow because busy" from "slow because degraded".
+  repeated string throttle_reasons = 6;
+  uint64 pcie_replay_count = 7;
+  repeated uint32 xid_errors = 8;
+
+  bool ecc_supported = 9;
+  uint64 ecc_volatile_errors = 10;
+  uint64 row_remap_pending = 11;
+}
+
+// ---------------------------------------------------------------------------
+// Workload spec
+// ---------------------------------------------------------------------------
+
+message ResourceRequest {
+  uint32 slots = 1;
+  uint32 min_vram_gb = 2;
+  string min_compute_capability = 3;
+  string min_driver = 4;
+  string min_cuda = 5;
+  uint32 min_encode_sessions = 6;
+  uint32 min_decode_sessions = 7;
+  bool require_ecc = 8;
+  // Label predicates that a node must satisfy, e.g. {"location": "lab-a"}.
+  map<string, string> required_labels = 9;
+  // Whole-machine exclusivity for workloads sensitive to host contention or
+  // using peer-to-peer transfers between GPUs (§8).
+  bool exclusive_host = 10;
+}
+
+enum LeaseMode {
+  LEASE_MODE_UNSPECIFIED = 0;
+  // Ends when the container exits. Preemption kills and requeues the task.
+  LEASE_MODE_BATCH = 1;
+  // Ends on explicit release or TTL expiry without renewal.
+  LEASE_MODE_SERVICE = 2;
+}
+
+message TaskSpec {
+  string task_id = 1;
+  string job_id = 2;
+  uint32 index = 3;
+  string image_digest = 4;
+  repeated string command = 5;
+  map<string, string> env = 6;
+  // Content-addressed asset references staged by the agent before start (§11).
+  repeated AssetRef assets = 7;
+  // jobs/{job_id}/tasks/{task_id}/attempts/{n}/
+  string output_prefix = 8;
+  uint32 attempt = 9;
+}
+
+message AssetRef {
+  // Content address; also the node cache key.
+  string digest = 1;
+  string uri = 2;
+  uint64 size_bytes = 3;
+  // Path inside the container where the asset is mounted.
+  string mount_path = 4;
+}
+
+// The per-slot share of the host, enforced via cgroups v2 through containerd.
+// A borrowed slot carries its proportional share of the host and nothing more.
+message HostShare {
+  double cores = 1;
+  uint32 ram_gb = 2;
+  uint32 scratch_gb = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Agent <-> control plane (§4)
+//
+// One bidirectional stream per node. Heartbeat up, assignments down.
+// ---------------------------------------------------------------------------
+
+message Register {
+  string join_token = 1;
+  string hostname = 2;
+  CapabilityDoc capabilities = 3;
+  // Marks a node backed by the simulated Device/Health/Executor providers.
+  // Badged visibly in the UI -- see §14 honesty rules.
+  bool simulated = 4;
+  // Set on reconnect so the control plane can reconcile prior leases.
+  string node_id = 5;
+}
+
+message RegisterAck {
+  string node_id = 1;
+  uint32 heartbeat_interval_ms = 2;
+  // Leases the control plane believes this node holds. The agent kills
+  // anything running that is not in this set.
+  repeated string active_lease_ids = 3;
+}
+
+message RunningTask {
+  string lease_id = 1;
+  string task_id = 2;
+  string state = 3;
+}
+
+message Heartbeat {
+  google.protobuf.Timestamp sent_at = 1;
+  repeated HealthSample samples = 2;
+  repeated RunningTask running = 3;
+  // Lease IDs the agent wishes to renew. Short TTLs with renewal (§9).
+  repeated string renew_lease_ids = 4;
+  // Digests currently resident in the node's content-addressed cache. Feeds
+  // the cache_residency scorer.
+  repeated string cached_digests = 5;
+  double load_avg_1m = 6;
+  uint32 free_scratch_gb = 7;
+}
+
+message Assignment {
+  string lease_id = 1;
+  TaskSpec task = 2;
+  repeated uint32 device_indices = 3;
+  LeaseMode mode = 4;
+  HostShare host_share = 5;
+  uint64 ttl_ms = 6;
+  // True when this lease runs on a machine owned by another pool. Borrowed
+  // leases run as preemptible regardless of the job's own preemptible flag.
+  bool borrowed = 7;
+  bool exclusive_host = 8;
+}
+
+message Preempt {
+  string lease_id = 1;
+  // Grace period before SIGKILL. Zero means immediate.
+  uint64 grace_ms = 2;
+  string reason = 3;
+}
+
+message Drain {
+  string reason = 1;
+  uint64 grace_ms = 2;
+}
+
+message LeaseRenewAck {
+  // Leases the control plane accepted a renewal for.
+  repeated string renewed = 1;
+  // Leases the control plane no longer recognises. The agent must stop these:
+  // the lease ID is the fencing token, and a stale holder is rejected.
+  repeated string rejected = 2;
+}
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_QUEUED = 1;
+  TASK_STATE_ASSIGNED = 2;
+  TASK_STATE_STAGING = 3;
+  TASK_STATE_RUNNING = 4;
+  TASK_STATE_DONE = 5;
+  TASK_STATE_FAILED = 6;
+  TASK_STATE_PREEMPTED = 7;
+}
+
+message TaskStatusUpdate {
+  // Fencing token. A stale holder is rejected at commit time.
+  string lease_id = 1;
+  string task_id = 2;
+  TaskState state = 3;
+  string message = 4;
+  int32 exit_code = 5;
+  string output_prefix = 6;
+  google.protobuf.Timestamp at = 7;
+}
+
+message AgentMessage {
+  oneof msg {
+    Register register = 1;
+    Heartbeat heartbeat = 2;
+    TaskStatusUpdate task_status = 3;
+  }
+}
+
+// Inject scripts a condition on a node for the trigger console (§14).
+//
+// Only the simulated providers act on this; the NVML and DCGM backends ignore
+// it, because a real card's temperature is not ours to set. It travels on the
+// existing stream rather than a side channel so that simulated and real nodes
+// keep exactly one connection to the control plane.
+message Inject {
+  // "thermal_throttle", "xid_error", or "clear".
+  string kind = 1;
+  uint32 device_index = 2;
+  int32 value = 3;
+}
+
+message ControlMessage {
+  oneof msg {
+    RegisterAck register_ack = 1;
+    Assignment assign = 2;
+    Preempt preempt = 3;
+    LeaseRenewAck renew_ack = 4;
+    Drain drain = 5;
+    Inject inject = 6;
+  }
+}
+
+service AgentService {
+  // Heartbeat up, assignments down, one connection.
+  rpc Connect(stream AgentMessage) returns (stream ControlMessage) {}
+}
+
+// ---------------------------------------------------------------------------
+// Client-facing API (§4)
+// ---------------------------------------------------------------------------
+
+message JobSpec {
+  string owner = 1;
+  string pool_id = 2;
+  string image_digest = 3;
+  repeated string command = 4;
+  map<string, string> env = 5;
+  ResourceRequest request = 6;
+  LeaseMode mode = 7;
+  bool preemptible = 8;
+  repeated AssetRef assets = 9;
+  // Fan-out: one task per element. The orchestrator does not interpret these
+  // -- a render job puts frame numbers here, and the scheduler never learns
+  // what a frame is.
+  repeated TaskParams tasks = 10;
+  string name = 11;
+}
+
+message TaskParams {
+  map<string, string> params = 1;
+}
+
+message SubmitJobRequest {
+  JobSpec spec = 1;
+}
+
+message SubmitJobResponse {
+  string job_id = 1;
+  repeated string task_ids = 2;
+}
+
+message Job {
+  string job_id = 1;
+  string name = 2;
+  string owner = 3;
+  string pool_id = 4;
+  string image_digest = 5;
+  string state = 6;
+  bool preemptible = 7;
+  google.protobuf.Timestamp submitted_at = 8;
+  uint32 tasks_total = 9;
+  uint32 tasks_done = 10;
+  uint32 tasks_running = 11;
+  uint32 tasks_queued = 12;
+  uint32 tasks_failed = 13;
+  ResourceRequest request = 14;
+}
+
+message Task {
+  string task_id = 1;
+  string job_id = 2;
+  uint32 index = 3;
+  TaskState state = 4;
+  uint32 attempt = 5;
+  string assigned_lease_id = 6;
+  string node_id = 7;
+  string output_prefix = 8;
+  map<string, string> params = 9;
+  google.protobuf.Timestamp started_at = 10;
+  google.protobuf.Timestamp finished_at = 11;
+  // Number of times this task has been preempted and requeued.
+  uint32 preemptions = 12;
+}
+
+message Slot {
+  string slot_id = 1;
+  string node_id = 2;
+  // "gpu" or "mig_instance". The scheduler does not distinguish.
+  string kind = 3;
+  uint32 device_index = 4;
+  uint32 vram_gb = 5;
+  string compute_capability = 6;
+  uint32 encode_sessions = 7;
+  uint32 decode_sessions = 8;
+  bool ecc_present = 9;
+  string state = 10;
+  string lease_id = 11;
+  string pool_id = 12;
+  // Set when the holding lease belongs to a pool other than the node's owner.
+  bool borrowed = 13;
+  HealthSample health = 14;
+  string job_id = 15;
+  string task_id = 16;
+}
+
+message Node {
+  string node_id = 1;
+  string hostname = 2;
+  string pool_id = 3;
+  string state = 4;
+  CapabilityDoc capabilities = 5;
+  map<string, string> labels = 6;
+  bool simulated = 7;
+  google.protobuf.Timestamp last_heartbeat = 8;
+  uint32 host_cores = 9;
+  uint32 host_ram_gb = 10;
+  uint32 host_scratch_gb = 11;
+  repeated Slot slots = 12;
+  // Host share already committed to leases on this node.
+  double allocated_cores = 13;
+  uint32 allocated_ram_gb = 14;
+  // Cleared while a machine reclaim is in flight, to stop the reclaim
+  // livelocking against new placements.
+  bool lendable = 15;
+  double load_avg_1m = 16;
+}
+
+message Pool {
+  string pool_id = 1;
+  string name = 2;
+  repeated string node_ids = 3;
+  uint32 guaranteed_slots = 4;
+  bool lendable = 5;
+  uint32 borrow_ceiling = 6;
+  // Live counters.
+  uint32 total_slots = 7;
+  uint32 used_slots = 8;
+  // Slots this pool has taken from other pools.
+  uint32 borrowed_slots = 9;
+  // Slots of this pool currently held by other pools.
+  uint32 lent_slots = 10;
+}
+
+message Lease {
+  string lease_id = 1;
+  string task_id = 2;
+  string job_id = 3;
+  string pool_id = 4;
+  repeated string slot_ids = 5;
+  string node_id = 6;
+  LeaseMode mode = 7;
+  bool borrowed = 8;
+  bool exclusive_host = 9;
+  double host_share_cores = 10;
+  uint32 host_share_ram_gb = 11;
+  google.protobuf.Timestamp granted_at = 12;
+  uint64 ttl_ms = 13;
+  google.protobuf.Timestamp renewed_at = 14;
+  string state = 15;
+}
+
+message ListNodesRequest {}
+message ListNodesResponse { repeated Node nodes = 1; }
+
+message ListPoolsRequest {}
+message ListPoolsResponse { repeated Pool pools = 1; }
+
+message UpsertPoolRequest { Pool pool = 1; }
+message UpsertPoolResponse { Pool pool = 1; }
+
+message ListJobsRequest { string owner = 1; }
+message ListJobsResponse { repeated Job jobs = 1; }
+
+message GetJobRequest { string job_id = 1; }
+message GetJobResponse {
+  Job job = 1;
+  repeated Task tasks = 2;
+}
+
+message CancelJobRequest { string job_id = 1; }
+message CancelJobResponse {}
+
+message ListLeasesRequest {}
+message ListLeasesResponse { repeated Lease leases = 1; }
+
+// Policy is data, hot-reloadable, editable via API. Never compiled in (§5).
+message Policy {
+  string preset = 1;
+  map<string, double> weights = 2;
+  uint64 reload_generation = 3;
+}
+
+message GetPolicyRequest {}
+message GetPolicyResponse {
+  Policy policy = 1;
+  // Names of every registered scorer, so the UI can build controls without a
+  // hardcoded list.
+  repeated string available_scorers = 2;
+  repeated string presets = 3;
+}
+
+message SetPolicyRequest { Policy policy = 1; }
+message SetPolicyResponse { Policy policy = 1; }
+
+// Trigger console (§14). Live demos fail waiting for organic events, so they
+// are scripted.
+enum TriggerKind {
+  TRIGGER_KIND_UNSPECIFIED = 0;
+  TRIGGER_KIND_NODE_FAILURE = 1;
+  TRIGGER_KIND_THERMAL_THROTTLE = 2;
+  // "CAD user logs in" -- the owning pool reclaims its machines.
+  TRIGGER_KIND_RECLAIM = 3;
+  TRIGGER_KIND_XID_ERROR = 4;
+  TRIGGER_KIND_NODE_RECOVER = 5;
+  TRIGGER_KIND_CLEAR_THROTTLE = 6;
+}
+
+message TriggerRequest {
+  TriggerKind kind = 1;
+  string node_id = 2;
+  string pool_id = 3;
+  // For reclaim: whether the owner needs an intact box or just a slot.
+  bool whole_machine = 4;
+}
+
+message TriggerResponse {
+  string detail = 1;
+  repeated string affected_lease_ids = 2;
+}
+
+// Explains the last placement decision for a task, so a demo audience can see
+// why the scheduler chose what it chose.
+message PlacementExplanation {
+  string task_id = 1;
+  string chosen_node_id = 2;
+  repeated string chosen_slot_ids = 3;
+  repeated CandidateScore candidates = 4;
+  repeated string filtered_out = 5;
+  google.protobuf.Timestamp at = 6;
+}
+
+message CandidateScore {
+  string node_id = 1;
+  double total = 2;
+  map<string, double> per_scorer = 3;
+  bool would_borrow = 4;
+  bool chosen = 5;
+}
+
+message ExplainRequest { string task_id = 1; }
+message ExplainResponse { PlacementExplanation explanation = 1; }
+
+message BootstrapRequest {
+  // The declarative YAML document from §13, applied idempotently.
+  string yaml = 1;
+}
+message BootstrapResponse { string detail = 1; }
+
+message IssueJoinTokenRequest { string pool_id = 1; }
+message IssueJoinTokenResponse { string token = 1; }
+
+service OrchService {
+  rpc SubmitJob(SubmitJobRequest) returns (SubmitJobResponse) {}
+  rpc ListJobs(ListJobsRequest) returns (ListJobsResponse) {}
+  rpc GetJob(GetJobRequest) returns (GetJobResponse) {}
+  rpc CancelJob(CancelJobRequest) returns (CancelJobResponse) {}
+
+  rpc ListNodes(ListNodesRequest) returns (ListNodesResponse) {}
+  rpc ListPools(ListPoolsRequest) returns (ListPoolsResponse) {}
+  rpc UpsertPool(UpsertPoolRequest) returns (UpsertPoolResponse) {}
+  rpc ListLeases(ListLeasesRequest) returns (ListLeasesResponse) {}
+
+  rpc GetPolicy(GetPolicyRequest) returns (GetPolicyResponse) {}
+  rpc SetPolicy(SetPolicyRequest) returns (SetPolicyResponse) {}
+
+  rpc Trigger(TriggerRequest) returns (TriggerResponse) {}
+  rpc Explain(ExplainRequest) returns (ExplainResponse) {}
+  rpc Bootstrap(BootstrapRequest) returns (BootstrapResponse) {}
+  rpc IssueJoinToken(IssueJoinTokenRequest) returns (IssueJoinTokenResponse) {}
+}
