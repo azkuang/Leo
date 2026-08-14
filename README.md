@@ -10,8 +10,6 @@ Borrowed work degrades; owned work never waits.
 The system is workload-agnostic. It schedules containers against GPU slots. It knows nothing about
 rendering, LLMs, or CAD.
 
-Implements the design in [Leo.md](Leo.md).
-
 ---
 
 ## Quick start
