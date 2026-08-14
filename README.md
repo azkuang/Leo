@@ -58,15 +58,6 @@ Stop with `./scripts/dev-down.sh`.
 Everything the trigger console does changes the *world*, not the scheduler's behaviour. The
 scheduler reacts through the same code paths it would use if the condition had arisen on its own.
 
-### Honesty
-
-- **Simulated nodes are badged everywhere they appear** — in the UI, in `orchctl fleet`, in the
-  header count that reads `3 sim · 0 real`. A demo that discloses this up front is stronger than one
-  where the audience discovers it later.
-- The simulated node is not a test fixture. It is a legitimate implementation of three of the four
-  extension seams, and the control plane cannot tell it apart from a real node.
-- A laptop *can* render the scene. It just takes forever. Claim the number, not "impossible".
-
 ---
 
 ## Architecture
