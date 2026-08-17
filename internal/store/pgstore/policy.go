@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/alexk/orch/internal/store"
 )
@@ -64,7 +65,18 @@ func (s *Store) IssueJoinToken(ctx context.Context, poolID string) (string, erro
 	token := uuid.NewString()
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO join_tokens (token, pool_id) VALUES ($1, $2)`, token, poolID)
-	return token, err
+	if err != nil {
+		// A pool that hasn't been created yet (bootstrap never ran, or the
+		// name was mistyped) trips the FK to `pools` here. Report that as
+		// the same ErrNotFound every other unknown-ID lookup uses, rather
+		// than leaking the raw constraint-violation error.
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+			return "", store.ErrNotFound
+		}
+		return "", err
+	}
+	return token, nil
 }
 
 // SaveExplanation records why the scheduler placed a task where it did.

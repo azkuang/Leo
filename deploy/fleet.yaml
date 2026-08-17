@@ -25,6 +25,15 @@ pools:
     lendable: true
     borrow_ceiling: 4
 
+  # A single real (non-simulated) workstation, kept isolated from the shared
+  # pools while it's being validated -- it neither lends into nor borrows
+  # from cad/render. Add its hostname to `nodes` once it has joined; a name
+  # not yet seen by the control plane is reported, not treated as an error.
+  - name: real-canary
+    nodes: []
+    lendable: false
+    borrow_ceiling: 0
+
 policy:
   preset: throughput
   weights:

@@ -554,6 +554,19 @@ func TestSnapshotReportsQueueAndAllocation(t *testing.T) {
 	}
 }
 
+func TestIssueJoinTokenUnknownPool(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+
+	// The pool was never bootstrapped (no UpsertPool call). Asking for a
+	// token against it must fail cleanly with ErrNotFound, not leak a raw
+	// foreign-key violation from the join_tokens insert.
+	_, err := st.IssueJoinToken(ctx, "cad")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for unknown pool, got %v", err)
+	}
+}
+
 func TestJoinTokenIsSingleUse(t *testing.T) {
 	ctx := context.Background()
 	st := newStore(t)

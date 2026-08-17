@@ -396,6 +396,9 @@ func (s *Server) IssueJoinToken(
 	req *connect.Request[orchv1.IssueJoinTokenRequest],
 ) (*connect.Response[orchv1.IssueJoinTokenResponse], error) {
 	token, err := s.store.IssueJoinToken(ctx, req.Msg.GetPoolId())
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("pool %q does not exist", req.Msg.GetPoolId()))
+	}
 	if err != nil {
 		return nil, connect.NewError(connect.CodeInternal, err)
 	}
