@@ -113,6 +113,13 @@ message TaskSpec {
   // jobs/{job_id}/tasks/{task_id}/attempts/{n}/
   string output_prefix = 8;
   uint32 attempt = 9;
+  // Per-task fan-out parameters, opaque to the orchestrator. Projected into
+  // the container as ORCH_PARAM_<UPPERCASE_KEY> env vars and available for
+  // argv templating via ${ORCH_PARAM_X}.
+  map<string, string> params = 10;
+  // Hard wall-clock limit on this task's run, in milliseconds. Zero means no
+  // limit.
+  uint64 timeout_ms = 11;
 }
 
 message AssetRef {
@@ -187,6 +194,25 @@ message Assignment {
   // leases run as preemptible regardless of the job's own preemptible flag.
   bool borrowed = 7;
   bool exclusive_host = 8;
+  // Temporary, per-lease write credentials scoped to this task's output
+  // prefix, minted by the control plane via STS AssumeRole. Unset when the
+  // control plane has no object store configured, in which case the agent
+  // uploads nothing.
+  ObjectCredentials creds = 9;
+}
+
+// Temporary write-only credentials scoped to
+// arn:aws:s3:::<bucket>/<output_prefix>* and expiring with the lease TTL, so
+// a zombie from a preempted attempt cannot write anywhere it is not supposed
+// to even if it tries.
+message ObjectCredentials {
+  string access_key_id = 1;
+  string secret_access_key = 2;
+  string session_token = 3;
+  string endpoint = 4;
+  string bucket = 5;
+  bool use_ssl = 6;
+  google.protobuf.Timestamp expires_at = 7;
 }
 
 message Preempt {
@@ -287,6 +313,9 @@ message JobSpec {
   // what a frame is.
   repeated TaskParams tasks = 10;
   string name = 11;
+  // Hard wall-clock limit per task, in milliseconds. Zero means no limit.
+  // Nothing else stops a hung CUDA kernel from holding a slot forever.
+  uint64 timeout_ms = 12;
 }
 
 message TaskParams {
@@ -333,6 +362,10 @@ message Task {
   google.protobuf.Timestamp finished_at = 11;
   // Number of times this task has been preempted and requeued.
   uint32 preemptions = 12;
+  // Process exit code. Optional (rather than a plain scalar) because "not yet
+  // finished" and "exited 0" are different facts -- mirrored by a nullable
+  // store column.
+  optional int32 exit_code = 13;
 }
 
 message Slot {
