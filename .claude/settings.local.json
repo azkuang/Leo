@@ -5,7 +5,8 @@
       "Bash(npm --version)",
       "Bash(docker --version)",
       "Bash(docker compose *)",
-      "Bash(psql --version)"
+      "Bash(psql --version)",
+      "Bash(sudo -n lsof -i :9443)"
     ]
   }
 }

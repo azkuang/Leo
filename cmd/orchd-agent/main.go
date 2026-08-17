@@ -22,6 +22,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/alexk/orch/internal/agent"
+	"github.com/alexk/orch/internal/agent/hardware"
 	"github.com/alexk/orch/internal/agent/sim"
 )
 
@@ -35,6 +36,10 @@ func main() {
 		cacheDir  = flag.String("cache-dir", "", "content-addressed asset cache directory")
 		labels    = flag.String("labels", "", "comma-separated key=value labels, e.g. location=lab-a,owner_team=cad")
 		logLevel  = flag.String("log-level", envOr("ORCH_LOG_LEVEL", "info"), "debug, info, warn or error")
+
+		containerdSocket = flag.String("containerd-socket", envOr("ORCH_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"), "containerd gRPC socket (non-simulated only)")
+		containerdNS     = flag.String("containerd-namespace", envOr("ORCH_CONTAINERD_NAMESPACE", "orch"), "containerd namespace for task containers (non-simulated only)")
+		nvidiaRuntime    = flag.String("nvidia-runtime", envOr("ORCH_NVIDIA_RUNTIME", "nvidia"), "containerd runtime name for nvidia-container-toolkit (non-simulated only)")
 
 		taskMin  = flag.Duration("sim-task-min", 5*time.Second, "simulated task duration, lower bound")
 		taskMax  = flag.Duration("sim-task-max", 15*time.Second, "simulated task duration, upper bound")
@@ -91,7 +96,12 @@ func main() {
 			"hostname", cfg.Hostname, "devices", len(p.Devices))
 	} else {
 		var err error
-		devices, health, exec, probe, err = realProviders()
+		devices, health, exec, probe, err = realProviders(hardware.Config{
+			ContainerdSocket:    *containerdSocket,
+			ContainerdNamespace: *containerdNS,
+			NvidiaRuntime:       *nvidiaRuntime,
+			CacheDir:            *cacheDir,
+		}, log)
 		if err != nil {
 			log.Error("no real device backend available", "err", err)
 			fmt.Fprintln(os.Stderr,
@@ -158,16 +168,13 @@ func parseLabels(s string) map[string]string {
 	return out
 }
 
-// realProviders resolves the hardware-backed seam implementations.
-//
-// These are the NVML, DCGM and containerd backends. They are not built into
-// this binary yet -- see internal/agent/hardware -- and the agent says so
-// plainly rather than silently reporting an empty or fabricated inventory. A
-// node that lies about its capabilities is worse than a node that refuses to
-// start.
-func realProviders() (agent.DeviceProvider, agent.HealthSource, agent.Executor, agent.HostProbe, error) {
-	return nil, nil, nil, nil, errors.New(
-		"the NVML/DCGM/containerd backends are not compiled into this build")
+// realProviders resolves the hardware-backed seam implementations: NVML,
+// DCGM and containerd, via internal/agent/hardware. It fails fast if any of
+// the three is unavailable on this machine rather than silently reporting an
+// empty or fabricated inventory -- a node that lies about its capabilities is
+// worse than a node that refuses to start.
+func realProviders(cfg hardware.Config, log *slog.Logger) (agent.DeviceProvider, agent.HealthSource, agent.Executor, agent.HostProbe, error) {
+	return hardware.New(cfg, log)
 }
 
 func newLogger(level string) *slog.Logger {
