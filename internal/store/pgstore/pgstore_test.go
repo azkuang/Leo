@@ -674,6 +674,53 @@ func TestPolicyRoundTripsAndBumpsGeneration(t *testing.T) {
 	}
 }
 
+// exit_code flows into store.TaskStatus but was previously dropped by the
+// terminal UPDATE in ApplyTaskStatus. It must be persisted and readable back
+// off the task, and it must stay nil (not zero) for a task that has not
+// finished -- "not yet finished" and "exited 0" are different facts.
+func TestApplyTaskStatusPersistsExitCode(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+
+	nodeID := registerNode(t, st, "ws-01", 2, 48)
+	job, tasks := createJob(t, st, "default", 1)
+	slots := slotIDs(t, st, nodeID, 2)
+
+	if _, err := st.Commit(ctx, store.Plan{Placements: []store.Placement{{
+		LeaseID: "lease-a", TaskID: tasks[0].TaskID, JobID: job.JobID,
+		PoolID: "default", NodeID: nodeID, SlotIDs: slots[0:1],
+		Mode: domain.ModeBatch, TTL: time.Minute,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, running, err := st.GetJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running[0].ExitCode != nil {
+		t.Fatalf("expected a nil exit code before the task finishes, got %v", *running[0].ExitCode)
+	}
+
+	if err := st.ApplyTaskStatus(ctx, store.TaskStatus{
+		LeaseID: "lease-a", TaskID: tasks[0].TaskID,
+		State: domain.TaskFailed, ExitCode: 13, Message: "boom", At: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, after, err := st.GetJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after[0].ExitCode == nil {
+		t.Fatal("expected a non-nil exit code after the task finished")
+	}
+	if *after[0].ExitCode != 13 {
+		t.Fatalf("exit code = %d, want 13", *after[0].ExitCode)
+	}
+}
+
 func TestMarkStaleNodesOffline(t *testing.T) {
 	ctx := context.Background()
 	st := newStore(t)
