@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
+	"strings"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -117,6 +119,44 @@ func (s *ObjectStore) Get(ctx context.Context, key string) (io.ReadCloser, int64
 		return nil, 0, fmt.Errorf("stat %s: %w", key, err)
 	}
 	return obj, info.Size, nil
+}
+
+// GetURI opens an object addressed by an "s3://bucket/key" URI, using this
+// client's endpoint and credentials but the bucket named in the URI rather
+// than the client's own default bucket -- inputs commonly live in a
+// different bucket (or at least a different naming convention) than a
+// task's outputs.
+func (s *ObjectStore) GetURI(ctx context.Context, uri string) (io.ReadCloser, int64, error) {
+	bucket, key, err := parseS3URI(uri)
+	if err != nil {
+		return nil, 0, err
+	}
+	obj, err := s.client.GetObject(ctx, bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return nil, 0, err
+	}
+	info, err := obj.Stat()
+	if err != nil {
+		_ = obj.Close()
+		return nil, 0, fmt.Errorf("stat %s: %w", uri, err)
+	}
+	return obj, info.Size, nil
+}
+
+func parseS3URI(uri string) (bucket, key string, err error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return "", "", fmt.Errorf("parse s3 uri: %w", err)
+	}
+	if u.Scheme != "s3" {
+		return "", "", fmt.Errorf("not an s3 uri: %s", uri)
+	}
+	bucket = u.Host
+	key = strings.TrimPrefix(u.Path, "/")
+	if bucket == "" || key == "" {
+		return "", "", fmt.Errorf("malformed s3 uri (want s3://bucket/key): %s", uri)
+	}
+	return bucket, key, nil
 }
 
 // PutFile uploads one local file to key.

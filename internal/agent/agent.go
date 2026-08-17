@@ -160,7 +160,7 @@ func New(cfg Config, log *slog.Logger, devices DeviceProvider, health HealthSour
 		cfg.WorkDir = filepathJoin(os.TempDir(), "orch-work-"+cfg.Hostname)
 	}
 
-	cache, err := NewCache(cfg.CacheDir)
+	cache, err := NewCache(cfg.CacheDir, objectStore)
 	if err != nil {
 		return nil, err
 	}
