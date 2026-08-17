@@ -53,6 +53,12 @@ type Mount struct {
 	ReadOnly      bool
 }
 
+// ContainerOutputDir is the single source of truth for the writable-output
+// mount path inside every task container. Both agent.go (building the Mount)
+// and hardware/containerd.go's taskEnv (building ORCH_OUTPUT_DIR) reference
+// this rather than each hardcoding the same string.
+const ContainerOutputDir = "/outputs"
+
 // StartSpec is everything needed to run one task.
 type StartSpec struct {
 	// LeaseID is the fencing token. It travels with every status report so a
@@ -60,10 +66,18 @@ type StartSpec struct {
 	LeaseID string
 	TaskID  string
 	JobID   string
+	// Index is the task's fan-out index, for identity env (ORCH_TASK_INDEX).
+	Index int
+	// Attempt is this task's attempt number, for identity env (ORCH_ATTEMPT).
+	Attempt int
 
 	Image   string
 	Command []string
-	Env     map[string]string
+	// Env is the fully-resolved environment: job-level Env merged with
+	// ORCH_PARAM_<KEY> projections and identity vars (ORCH_JOB_ID,
+	// ORCH_TASK_ID, ...), built once in agent.go so real and simulated nodes
+	// see identical values.
+	Env map[string]string
 
 	// DeviceIndices are the physical devices this task may use. Everything
 	// else on the machine is off limits.
@@ -81,7 +95,18 @@ type StartSpec struct {
 	// OutputPrefix is unique per attempt, so a preempted attempt's writes are
 	// simply orphaned rather than needing cleanup.
 	OutputPrefix string
-	Params       map[string]string
+	// Params are the task's raw fan-out parameters, opaque to the
+	// orchestrator -- kept distinct from Env because the simulator reads
+	// specific keys (e.g. "sim_duration_ms") directly rather than through the
+	// container-facing env projection.
+	Params map[string]string
+
+	// LogPath is where the executor should send the task's stdout/stderr, so
+	// a failed run is attributable instead of interleaved into the agent's
+	// own log.
+	LogPath string
+	// Timeout is a hard wall-clock limit on the run. Zero means no limit.
+	Timeout time.Duration
 }
 
 // Handle identifies a running container to the executor that started it.
@@ -106,6 +131,12 @@ type Executor interface {
 	Start(ctx context.Context, spec StartSpec) (Handle, error)
 	Stop(ctx context.Context, h Handle, grace time.Duration) error
 	Status(ctx context.Context, h Handle) (Status, error)
+	// Cleanup releases whatever resources Start acquired for h (container,
+	// snapshot, simulator bookkeeping). It is a separate call from Status so
+	// that a caller which stops polling a task (e.g. after preemption) still
+	// has a way to reclaim resources without depending on one more Status
+	// call happening to observe the terminal state first.
+	Cleanup(ctx context.Context, h Handle) error
 }
 
 // HostProbe reports the machine's own resources. Not a seam -- there are four

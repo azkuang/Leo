@@ -9,7 +9,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -30,6 +35,29 @@ type Injector interface {
 	ClearConditions()
 }
 
+// Reconciler is implemented by executors that can report which leases they
+// believe are still running, independent of the agent process's own
+// (restart-volatile) bookkeeping. Only ContainerdExecutor needs this:
+// containerd is a separate daemon that outlives a crashed agent process, so
+// without it a crashed agent leaks GPU containers -- and the VRAM they hold
+// -- until the machine reboots. The simulator has no state that survives a
+// process restart in the first place, so it does not implement this.
+type Reconciler interface {
+	RunningLeases(ctx context.Context) (map[string]Handle, error)
+}
+
+// stopWatchdogSlack bounds how long the poll loop waits for a stopped task to
+// actually reach a terminal state, on top of whatever grace period Stop was
+// given, before forcing Cleanup anyway. Without this bound a task whose
+// container never reports back (a stuck runtime, a wedged driver) would pin
+// its runningTask entry, and the goroutine polling it, forever.
+const stopWatchdogSlack = 30 * time.Second
+
+// watchdogRestBetweenTicks is used to disable the watchdog timer when a task
+// has not been asked to stop. A timer with a very long duration rather than a
+// nil *time.Timer keeps the select loop uniform.
+const watchdogRestBetweenTicks = 365 * 24 * time.Hour
+
 // Config configures a node agent.
 type Config struct {
 	ServerURL string
@@ -37,7 +65,12 @@ type Config struct {
 	Hostname  string
 	Simulated bool
 	CacheDir  string
-	Labels    map[string]string
+	// WorkDir holds per-lease scratch state: the writable output directory a
+	// task's container mounts, and its log file. Unlike CacheDir this is
+	// wiped per attempt (agent.go's startTask removes it once the attempt's
+	// outputs are uploaded), so nothing here is precious across restarts.
+	WorkDir string
+	Labels  map[string]string
 
 	HeartbeatInterval time.Duration
 	ReconnectBackoff  time.Duration
@@ -58,6 +91,13 @@ type Agent struct {
 	probe   HostProbe
 	cache   *Cache
 
+	// objectStore is the default (long-lived-credential) upload client, used
+	// when a lease's assignment carries no per-lease STS credentials -- e.g.
+	// a small deployment that has not wired up STS at all. Nil means no
+	// object store is configured, in which case the agent uploads nothing
+	// and behaves exactly as it did before this existed.
+	objectStore *ObjectStore
+
 	// Set only when the providers are simulated.
 	injector Injector
 
@@ -73,11 +113,37 @@ type runningTask struct {
 	leaseID string
 	taskID  string
 	handle  Handle
-	cancel  context.CancelFunc
+	// cancel tears down runCtx, the context passed to exec.Start and the
+	// cache stage. It is invoked only when startTask itself returns (session
+	// teardown), never by stopTask -- stopTask used to call this directly,
+	// which cancelled the very context the poll loop was selecting on and so
+	// made it exit before it could ever observe a terminal Status, leaking a
+	// container (and, on real hardware, a snapshot and the VRAM it held) on
+	// every preemption.
+	cancel context.CancelFunc
+
+	// stopped is closed by stopTask to signal "a Stop has been sent, start
+	// the watchdog". stopOnce guards against a second stopTask call (e.g.
+	// preemption followed by a rejected lease renewal) closing an
+	// already-closed channel.
+	stopOnce sync.Once
+	stopped  chan struct{}
+	// grace is read by the poll loop after stopped fires, to size the
+	// watchdog. Written under Agent.mu, alongside every other runningTask
+	// field.
+	grace time.Duration
+
+	// timedOut distinguishes "killed because the task exceeded its
+	// deadline" (which must be reported as a FAILED task) from ordinary
+	// preemption (which must not be reported at all -- the lease has moved
+	// on and a report would just be rejected as stale).
+	timedOut atomic.Bool
 }
 
-// New creates an agent from a set of seam implementations.
-func New(cfg Config, log *slog.Logger, devices DeviceProvider, health HealthSource, exec Executor, probe HostProbe) (*Agent, error) {
+// New creates an agent from a set of seam implementations. objectStore may be
+// nil, meaning no object store is configured; see Config.WorkDir and the
+// ObjectStore doc comment.
+func New(cfg Config, log *slog.Logger, devices DeviceProvider, health HealthSource, exec Executor, probe HostProbe, objectStore *ObjectStore) (*Agent, error) {
 	if cfg.HeartbeatInterval <= 0 {
 		cfg.HeartbeatInterval = 2 * time.Second
 	}
@@ -90,6 +156,9 @@ func New(cfg Config, log *slog.Logger, devices DeviceProvider, health HealthSour
 	if cfg.CacheDir == "" {
 		cfg.CacheDir = filepathJoin(os.TempDir(), "orch-cache-"+cfg.Hostname)
 	}
+	if cfg.WorkDir == "" {
+		cfg.WorkDir = filepathJoin(os.TempDir(), "orch-work-"+cfg.Hostname)
+	}
 
 	cache, err := NewCache(cfg.CacheDir)
 	if err != nil {
@@ -97,15 +166,16 @@ func New(cfg Config, log *slog.Logger, devices DeviceProvider, health HealthSour
 	}
 
 	a := &Agent{
-		cfg:     cfg,
-		log:     log,
-		devices: devices,
-		health:  health,
-		exec:    exec,
-		probe:   probe,
-		cache:   cache,
-		running: map[string]*runningTask{},
-		client:  newAgentClient(cfg.ServerURL),
+		cfg:         cfg,
+		log:         log,
+		devices:     devices,
+		health:      health,
+		exec:        exec,
+		probe:       probe,
+		cache:       cache,
+		objectStore: objectStore,
+		running:     map[string]*runningTask{},
+		client:      newAgentClient(cfg.ServerURL),
 	}
 	if inj, ok := devices.(Injector); ok {
 		a.injector = inj
@@ -202,7 +272,12 @@ func (a *Agent) session(ctx context.Context) error {
 	// Anything running that the control plane does not list is a survivor of a
 	// previous session whose lease is gone. It is stopped rather than adopted:
 	// the lease ID is the fencing token and this one is no longer valid.
-	a.reconcileRunning(ctx, ack.GetActiveLeaseIds())
+	valid := make(map[string]bool, len(ack.GetActiveLeaseIds()))
+	for _, id := range ack.GetActiveLeaseIds() {
+		valid[id] = true
+	}
+	a.reconcileRunning(ctx, valid)
+	a.reconcileOrphans(ctx, valid)
 
 	go a.consumeHealth(ctx)
 
@@ -373,7 +448,8 @@ func (a *Agent) applyInjection(in *orchv1.Inject) {
 	}
 }
 
-// startTask stages assets and runs the container, reporting each transition.
+// startTask stages assets, runs the container, uploads its outputs, and
+// reports each transition.
 func (a *Agent) startTask(ctx context.Context, stream *connect.BidiStreamForClient[orchv1.AgentMessage, orchv1.ControlMessage], as *orchv1.Assignment) {
 	leaseID := as.GetLeaseId()
 	task := as.GetTask()
@@ -396,8 +472,9 @@ func (a *Agent) startTask(ctx context.Context, stream *connect.BidiStreamForClie
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
+	rt := &runningTask{leaseID: leaseID, taskID: task.GetTaskId(), cancel: cancel, stopped: make(chan struct{})}
 	a.mu.Lock()
-	a.running[leaseID] = &runningTask{leaseID: leaseID, taskID: task.GetTaskId(), cancel: cancel}
+	a.running[leaseID] = rt
 	a.mu.Unlock()
 
 	defer func() {
@@ -415,25 +492,60 @@ func (a *Agent) startTask(ctx context.Context, stream *connect.BidiStreamForClie
 		return
 	}
 
+	// A per-attempt writable directory, mode 0777: images that run as a
+	// non-root USER cannot write into a root-owned bind mount, and that
+	// failure looks like "the container produced nothing" rather than a
+	// permissions error anywhere obvious.
+	leaseDir := filepath.Join(a.cfg.WorkDir, leaseID)
+	outDir := filepath.Join(leaseDir, "out")
+	if err := os.MkdirAll(outDir, 0o777); err != nil {
+		report(orchv1.TaskState_TASK_STATE_FAILED, "create output dir: "+err.Error(), 1)
+		return
+	}
+	_ = os.Chmod(outDir, 0o777) // MkdirAll honours umask; force it open regardless.
+	mounts = append(mounts, Mount{HostPath: outDir, ContainerPath: ContainerOutputDir, ReadOnly: false})
+	defer os.RemoveAll(leaseDir)
+
 	indices := make([]int, 0, len(as.GetDeviceIndices()))
 	for _, i := range as.GetDeviceIndices() {
 		indices = append(indices, int(i))
+	}
+
+	env, collisions := buildEnv(task.GetEnv(), task.GetParams(), map[string]string{
+		"ORCH_JOB_ID":        task.GetJobId(),
+		"ORCH_TASK_ID":       task.GetTaskId(),
+		"ORCH_TASK_INDEX":    strconv.Itoa(int(task.GetIndex())),
+		"ORCH_ATTEMPT":       strconv.Itoa(int(task.GetAttempt())),
+		"ORCH_LEASE_ID":      leaseID,
+		"ORCH_OUTPUT_PREFIX": task.GetOutputPrefix(),
+		"ORCH_OUTPUT_DIR":    ContainerOutputDir,
+	})
+	for _, k := range collisions {
+		a.log.Warn("task param collides with job env, param wins", "lease", leaseID, "key", k)
 	}
 
 	spec := StartSpec{
 		LeaseID:        leaseID,
 		TaskID:         task.GetTaskId(),
 		JobID:          task.GetJobId(),
+		Index:          int(task.GetIndex()),
+		Attempt:        int(task.GetAttempt()),
 		Image:          task.GetImageDigest(),
-		Command:        task.GetCommand(),
-		Env:            task.GetEnv(),
+		Command:        expandArgv(task.GetCommand(), env),
+		Env:            env,
 		DeviceIndices:  indices,
 		HostShareCores: as.GetHostShare().GetCores(),
 		HostShareRAMGB: int(as.GetHostShare().GetRamGb()),
 		Mounts:         mounts,
 		OutputPrefix:   task.GetOutputPrefix(),
+		Params:         task.GetParams(),
+		LogPath:        filepath.Join(leaseDir, "task.log"),
+		Timeout:        time.Duration(task.GetTimeoutMs()) * time.Millisecond,
 	}
 
+	objStore := a.resolveObjectStore(leaseID, as.GetCreds())
+
+	startedAt := time.Now()
 	handle, err := a.exec.Start(runCtx, spec)
 	if err != nil {
 		report(orchv1.TaskState_TASK_STATE_FAILED, "start failed: "+err.Error(), 1)
@@ -441,46 +553,140 @@ func (a *Agent) startTask(ctx context.Context, stream *connect.BidiStreamForClie
 	}
 
 	a.mu.Lock()
-	if rt := a.running[leaseID]; rt != nil {
-		rt.handle = handle
-	}
+	rt.handle = handle
 	a.mu.Unlock()
 
 	report(orchv1.TaskState_TASK_STATE_RUNNING, "", 0)
 
+	if spec.Timeout > 0 {
+		timer := time.AfterFunc(spec.Timeout, func() {
+			rt.timedOut.Store(true)
+			a.log.Warn("task exceeded timeout", "lease", leaseID, "timeout", spec.Timeout)
+			a.stopTask(context.Background(), leaseID, 10*time.Second)
+		})
+		defer timer.Stop()
+	}
+
 	poll := time.NewTicker(500 * time.Millisecond)
 	defer poll.Stop()
+	watchdog := time.NewTimer(watchdogRestBetweenTicks)
+	defer watchdog.Stop()
 
+	stoppedCh := rt.stopped
 	for {
 		select {
-		case <-runCtx.Done():
-			// Preemption already tore this down, and the lease is gone. Saying
-			// anything now would be rejected at the control plane as a stale
-			// holder, which is exactly the intended behaviour.
+		case <-ctx.Done():
+			// The session itself is ending (agent shutting down or
+			// reconnecting). Whatever this task's real state is, the next
+			// session's reconcileOrphans will find it via the executor, not
+			// via this goroutine.
 			return
+
+		case <-stoppedCh:
+			// Fires exactly once: after this, block forever on a nil channel
+			// so the case never wins a future select (a closed channel would
+			// otherwise be perpetually ready and starve the other cases).
+			stoppedCh = nil
+			a.mu.Lock()
+			grace := rt.grace
+			a.mu.Unlock()
+			watchdog.Reset(grace + stopWatchdogSlack)
+
+		case <-watchdog.C:
+			a.log.Warn("watchdog expired waiting for a stopped task to exit", "lease", leaseID)
+			_ = a.exec.Cleanup(context.Background(), handle)
+			if rt.timedOut.Load() {
+				report(orchv1.TaskState_TASK_STATE_FAILED, "exceeded timeout", 0)
+			}
+			return
+
 		case <-poll.C:
-			st, err := a.exec.Status(runCtx, handle)
+			st, err := a.exec.Status(ctx, handle)
 			if err != nil {
 				report(orchv1.TaskState_TASK_STATE_FAILED, "status: "+err.Error(), 1)
+				_ = a.exec.Cleanup(context.Background(), handle)
 				return
 			}
 			switch st.State {
-			case ExecExited:
-				report(orchv1.TaskState_TASK_STATE_DONE, st.Message, int32(st.ExitCode))
-				return
-			case ExecFailed:
-				report(orchv1.TaskState_TASK_STATE_FAILED, st.Message, int32(st.ExitCode))
+			case ExecExited, ExecFailed:
+				a.finishTask(context.Background(), report, objStore, spec, outDir, startedAt, st)
+				_ = a.exec.Cleanup(context.Background(), handle)
 				return
 			case ExecKilled:
+				_ = a.exec.Cleanup(context.Background(), handle)
+				if rt.timedOut.Load() {
+					report(orchv1.TaskState_TASK_STATE_FAILED, "exceeded timeout", int32(st.ExitCode))
+				}
+				// Otherwise: preemption already tore this down, and the lease
+				// is gone. Saying anything now would be rejected at the
+				// control plane as a stale holder, which is exactly the
+				// intended behaviour.
 				return
 			}
 		}
 	}
 }
 
+// finishTask uploads a finished task's outputs (if an object store is
+// configured) and reports the terminal state. "done" means the bytes are
+// durable, not that the process exited: an upload failure is always reported
+// as FAILED, never DONE, and the exit-status FAILED case still tries to
+// upload whatever partial output and logs exist.
+func (a *Agent) finishTask(
+	ctx context.Context, report func(orchv1.TaskState, string, int32),
+	objStore *ObjectStore, spec StartSpec, outDir string, startedAt time.Time, st Status,
+) {
+	finalState := orchv1.TaskState_TASK_STATE_DONE
+	if st.State == ExecFailed {
+		finalState = orchv1.TaskState_TASK_STATE_FAILED
+	}
+
+	if objStore != nil {
+		// Keeps the lease renewing via sendLoop (which renews everything
+		// still in a.running -- the defer that removes the entry only fires
+		// once startTask returns) while the upload, which can take a while
+		// for large outputs, is in flight.
+		report(orchv1.TaskState_TASK_STATE_RUNNING, "uploading output", 0)
+		if err := a.uploadOutputs(ctx, objStore, spec.OutputPrefix, outDir, spec.LogPath, startedAt, st); err != nil {
+			a.log.Warn("output upload failed", "lease", spec.LeaseID, "err", err)
+			report(orchv1.TaskState_TASK_STATE_FAILED, "upload failed: "+err.Error(), int32(st.ExitCode))
+			return
+		}
+	}
+
+	report(finalState, st.Message, int32(st.ExitCode))
+}
+
+// resolveObjectStore picks the client this task's uploads go through: a
+// per-lease client built from the control plane's STS credentials when
+// present, or the agent's own default (static-credential) client otherwise.
+// Either may be nil, meaning no upload happens.
+func (a *Agent) resolveObjectStore(leaseID string, creds *orchv1.ObjectCredentials) *ObjectStore {
+	if creds == nil || creds.GetAccessKeyId() == "" {
+		return a.objectStore
+	}
+	s, err := NewObjectStoreFromSTS(STSCredentials{
+		Endpoint:        creds.GetEndpoint(),
+		Bucket:          creds.GetBucket(),
+		AccessKeyID:     creds.GetAccessKeyId(),
+		SecretAccessKey: creds.GetSecretAccessKey(),
+		SessionToken:    creds.GetSessionToken(),
+		UseSSL:          creds.GetUseSsl(),
+	})
+	if err != nil {
+		a.log.Warn("could not build per-lease object store client, falling back to default",
+			"lease", leaseID, "err", err)
+		return a.objectStore
+	}
+	return s
+}
+
 func (a *Agent) stopTask(ctx context.Context, leaseID string, grace time.Duration) {
 	a.mu.Lock()
 	rt := a.running[leaseID]
+	if rt != nil {
+		rt.grace = grace
+	}
 	a.mu.Unlock()
 
 	if rt == nil {
@@ -491,17 +697,12 @@ func (a *Agent) stopTask(ctx context.Context, leaseID string, grace time.Duratio
 			a.log.Warn("stop failed", "lease", leaseID, "err", err)
 		}
 	}
-	rt.cancel()
+	rt.stopOnce.Do(func() { close(rt.stopped) })
 }
 
 // reconcileRunning stops anything running that the control plane did not
 // acknowledge, after a reconnect.
-func (a *Agent) reconcileRunning(ctx context.Context, active []string) {
-	valid := make(map[string]bool, len(active))
-	for _, id := range active {
-		valid[id] = true
-	}
-
+func (a *Agent) reconcileRunning(ctx context.Context, valid map[string]bool) {
 	a.mu.Lock()
 	var stale []string
 	for id := range a.running {
@@ -515,6 +716,88 @@ func (a *Agent) reconcileRunning(ctx context.Context, active []string) {
 		a.log.Warn("stopping task with an unrecognised lease", "lease", id)
 		a.stopTask(ctx, id, 0)
 	}
+}
+
+// reconcileOrphans asks the executor (if it supports Reconciler) which
+// leases it believes are still running -- independent of this agent
+// process's own bookkeeping, which is empty just after a restart -- and
+// kills anything the control plane does not recognise. Containerd is a
+// separate daemon that outlives a crashed agent process; without this, a
+// crashed agent leaks GPU containers, and the VRAM they hold, until the
+// machine reboots.
+func (a *Agent) reconcileOrphans(ctx context.Context, valid map[string]bool) {
+	rec, ok := a.exec.(Reconciler)
+	if !ok {
+		return
+	}
+	running, err := rec.RunningLeases(ctx)
+	if err != nil {
+		a.log.Warn("listing executor's running leases failed", "err", err)
+		return
+	}
+	for leaseID, h := range running {
+		a.mu.Lock()
+		_, tracked := a.running[leaseID]
+		a.mu.Unlock()
+		if tracked || valid[leaseID] {
+			// Either this session's own startTask is already watching it, or
+			// the control plane still recognises the lease -- in the latter
+			// case it is not orphaned, just running without a local
+			// runningTask entry to poll it (a smaller gap than leaking it
+			// forever, and resolved the moment the lease ends or is
+			// preempted through the normal path).
+			continue
+		}
+		a.log.Warn("killing orphaned container from a previous agent process", "lease", leaseID)
+		_ = a.exec.Stop(ctx, h, 0)
+		_ = a.exec.Cleanup(ctx, h)
+	}
+}
+
+// buildEnv merges job-level env, task params projected as
+// ORCH_PARAM_<UPPERCASE_KEY>, and identity vars into the environment a task
+// container sees. Job env applies first so params can never be silently
+// shadowed; on a key collision the param wins, and the key is returned so
+// the caller can log it.
+func buildEnv(jobEnv, params, identity map[string]string) (env map[string]string, collisions []string) {
+	env = make(map[string]string, len(jobEnv)+len(params)+len(identity))
+	for k, v := range jobEnv {
+		env[k] = v
+	}
+
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		envKey := "ORCH_PARAM_" + strings.ToUpper(k)
+		if _, exists := env[envKey]; exists {
+			collisions = append(collisions, envKey)
+		}
+		env[envKey] = params[k]
+	}
+
+	for k, v := range identity {
+		env[k] = v
+	}
+	return env, collisions
+}
+
+// expandArgv expands ${ORCH_PARAM_X}-style references in each command
+// argument against env, so a stock image (ffmpeg, Blender) can take
+// arguments like "--frame ${ORCH_PARAM_FRAME}" on argv without a wrapper
+// entrypoint.
+//
+// This happens here, in agent.go, rather than in the executor: putting it in
+// containerd.go would make real and simulated nodes diverge, which this
+// project does not allow (see the package doc).
+func expandArgv(command []string, env map[string]string) []string {
+	out := make([]string, len(command))
+	for i, c := range command {
+		out[i] = os.Expand(c, func(key string) string { return env[key] })
+	}
+	return out
 }
 
 func toProtoSamples(in []domain.HealthSample) []*orchv1.HealthSample {
