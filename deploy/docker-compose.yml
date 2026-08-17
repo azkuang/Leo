@@ -45,6 +45,21 @@ services:
       - "9000:9000"
       - "9001:9001"
 
+  # One-shot: creates the bucket orchd/agents expect (ORCH_S3_BUCKET below)
+  # so `docker compose up` alone is enough to exercise the data plane --
+  # without this, every upload fails with NoSuchBucket until someone runs
+  # `mc mb` by hand.
+  createbuckets:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 orch orchorch &&
+      mc mb --ignore-existing local/orch
+      "
+
   orchd:
     build:
       context: ..
@@ -53,9 +68,20 @@ services:
       ORCH_DSN: postgres://orch:orch@postgres:5432/orch?sslmode=disable
       ORCH_LISTEN: ":9443"
       ORCH_LOG_LEVEL: info
+      # STS-minted, per-lease write credentials -- see README.md's
+      # "Object storage" section. AccessKey/SecretKey here are the broad
+      # admin credential used only to call AssumeRole; agents only ever see
+      # the narrow, expiring credential that call returns.
+      ORCH_S3_ENDPOINT: minio:9000
+      ORCH_S3_STS_ENDPOINT: minio:9000
+      ORCH_S3_BUCKET: orch
+      ORCH_S3_ACCESS_KEY: orch
+      ORCH_S3_SECRET_KEY: orchorch
     depends_on:
       postgres:
         condition: service_healthy
+      createbuckets:
+        condition: service_completed_successfully
     ports:
       # Agents, API clients and the UI all arrive here. One port, because the
       # UI is embedded in the binary.

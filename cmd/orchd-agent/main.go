@@ -42,7 +42,7 @@ func main() {
 
 		containerdSocket = flag.String("containerd-socket", envOr("ORCH_CONTAINERD_SOCKET", "/run/containerd/containerd.sock"), "containerd gRPC socket (non-simulated only)")
 		containerdNS     = flag.String("containerd-namespace", envOr("ORCH_CONTAINERD_NAMESPACE", "orch"), "containerd namespace for task containers (non-simulated only)")
-		gpuMode          = flag.String("gpu-mode", envOr("ORCH_GPU_MODE", hardware.GPUModeCDI), "GPU attachment mode: cdi (default, needs `nvidia-ctk cdi generate`) or runtime-binary")
+		gpuMode          = flag.String("gpu-mode", envOr("ORCH_GPU_MODE", hardware.GPUModeCDI), "GPU attachment mode: cdi (default, needs 'nvidia-ctk cdi generate') or runtime-binary")
 		nvidiaRuntimeBin = flag.String("nvidia-container-runtime-binary", envOr("ORCH_NVIDIA_CONTAINER_RUNTIME_BINARY", ""), "runc-compatible binary for gpu-mode=runtime-binary")
 		devShmMB         = flag.Int64("dev-shm-mb", envInt64Or("ORCH_DEV_SHM_MB", 1024), "size of /dev/shm inside every task container, in MB")
 

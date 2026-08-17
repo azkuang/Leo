@@ -14,11 +14,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Every flag orchd-agent takes has an ORCH_* environment fallback, so the
+# whole node configuration -- server, cache dir, GPU mode, S3 credentials,
+# containerd socket -- lives in this one env file rather than being split
+# between it and this unit. See install-agent.sh's heredoc for the full set.
 EnvironmentFile=/etc/orch/agent.env
-ExecStart=/usr/local/bin/orchd-agent \
-    --server=${ORCH_SERVER} \
-    --cache-dir=/var/lib/orch/cache \
-    --labels=${ORCH_LABELS}
+ExecStart=/usr/local/bin/orchd-agent
 Restart=always
 RestartSec=5
 

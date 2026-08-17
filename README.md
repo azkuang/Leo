@@ -242,12 +242,63 @@ trees for a benefit this project does not need.
 
 | Interface | Methods | Implementations |
 |---|---|---|
-| `Executor` | `Start` / `Stop` / `Status` | simulated · *containerd pending* |
-| `DeviceProvider` | `Enumerate` | simulated · *NVML pending* |
-| `HealthSource` | `Stream` | simulated · *DCGM pending* |
+| `Executor` | `Start` / `Stop` / `Status` / `Cleanup` | simulated · containerd |
+| `DeviceProvider` | `Enumerate` | simulated · NVML |
+| `HealthSource` | `Stream` | simulated · DCGM |
 | `Scorer` | `Score` | seven, one per dimension |
 
 Adding a scoring dimension means adding a file with an `init()` that calls `Register`. It appears in
 the API, the CLI and the UI's weight controls without touching any of them.
+
+The object store (`internal/agent/objectstore.go`, wrapping `minio-go/v7`) is deliberately **not** a
+fifth seam. `Cache` and `HostProbe` already establish the pattern this codebase uses for
+infrastructure every backend shares rather than swaps; the object store is exactly that -- real and
+simulated nodes upload through the identical path (`sim.go`'s `writeSimOutput`).
+
+---
+
+## Real hardware
+
+A real node needs a driver, `nvidia-container-toolkit`, and containerd -- `--simulated` skips all
+three. Two things need doing once per node beyond what `install-agent.sh` automates:
+
+**GPU attachment (CDI, the default).** containerd's client API (what this agent uses, as opposed to
+its CRI plugin) does not read the `nvidia` runtime stanza `nvidia-ctk runtime configure` writes into
+`config.toml` -- that stanza is CRI-only. Instead the agent injects devices via CDI, which needs one
+generated file:
+
+```bash
+nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+```
+
+Nodes where that has not been done yet can fall back to invoking `nvidia-container-runtime` directly
+with `ORCH_GPU_MODE=runtime-binary` (see below).
+
+**Object storage.** Set `ORCH_S3_*` on the agent (`install-agent.sh` writes these into
+`/etc/orch/agent.env`) and the matching `ORCH_S3_*` plus `ORCH_S3_STS_ENDPOINT`,
+`ORCH_S3_ACCESS_KEY`, `ORCH_S3_SECRET_KEY` on `orchd`. Unset, task outputs are simply not uploaded --
+this is not a hard dependency for the rest of the system.
+
+| Variable | Where | Meaning |
+|---|---|---|
+| `ORCH_S3_ENDPOINT` | agent, orchd | Object store host:port |
+| `ORCH_S3_BUCKET` | agent, orchd | Bucket name |
+| `ORCH_S3_REGION` | agent | Region, if the store cares |
+| `ORCH_S3_ACCESS_KEY` / `ORCH_S3_SECRET_KEY` | agent, orchd | On the agent: the static fallback credential used when no per-lease STS credential is present. On orchd: the broad admin credential used only to call `AssumeRole` -- never sent to an agent. |
+| `ORCH_S3_USE_SSL` | agent, orchd | Use TLS against the store |
+| `ORCH_S3_PATH_STYLE` | agent | Path-style bucket addressing; MinIO needs `true` |
+| `ORCH_S3_STS_ENDPOINT` | orchd | Where `AssumeRole` is POSTed; defaults to `ORCH_S3_ENDPOINT` (MinIO serves both) |
+
+When orchd's S3 config is set, every `Assignment` carries a temporary, write-only credential scoped
+to `arn:aws:s3:::<bucket>/<output_prefix>*` and expiring with the lease TTL -- the enforced version of
+"a zombie writes where nobody reads" (see Leases and fencing, above). `orchctl put <file>` uploads
+straight to the bucket and prints a ready `--asset-uri`/`--asset-digest` pair for `orchctl submit`,
+keeping the control plane out of the input path entirely.
+
+Other `ORCH_*` agent variables: `ORCH_CONTAINERD_SOCKET`, `ORCH_CONTAINERD_NAMESPACE`,
+`ORCH_GPU_MODE` (`cdi` or `runtime-binary`), `ORCH_NVIDIA_CONTAINER_RUNTIME_BINARY`,
+`ORCH_DEV_SHM_MB`, `ORCH_CACHE_DIR`, `ORCH_WORK_DIR`, `ORCH_SIMULATED`. Every flag `orchd-agent`
+takes has a matching env fallback, so a deployed node is configured entirely through
+`/etc/orch/agent.env`, not by editing its systemd unit.
 
 ---

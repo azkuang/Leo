@@ -34,6 +34,8 @@ Commands:
   jobs                     List recent jobs
   job <job-id>             Show a job and its tasks
   submit                   Submit a job
+  put <file>               Upload a file straight to object storage; prints
+                           a ready --asset-uri/--asset-digest for submit
   cancel <job-id>          Cancel a job
   leases                   List active leases
   policy                   Show scoring weights and registered scorers
@@ -83,6 +85,8 @@ func dispatch(ctx context.Context, c orchv1connect.OrchServiceClient, server str
 		return cmdJob(ctx, c, args[1])
 	case "submit":
 		return cmdSubmit(ctx, c, args[1:])
+	case "put":
+		return cmdPut(ctx, args[1:])
 	case "cancel":
 		if len(args) < 2 {
 			return errors.New("usage: orchctl cancel <job-id>")
