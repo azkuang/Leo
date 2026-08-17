@@ -30,11 +30,17 @@ type Server struct {
 	hub       *Hub
 	reclaimer Reclaimer
 	log       *slog.Logger
+
+	// defaultTaskTimeout applies to a job that does not set its own
+	// timeout_ms. Zero means no default (no timeout unless a job asks for
+	// one) -- nothing here forces a limit on a caller that never wanted one.
+	defaultTaskTimeout time.Duration
 }
 
-// NewServer creates the API server.
-func NewServer(st store.Store, bus *events.Bus, hub *Hub, r Reclaimer, log *slog.Logger) *Server {
-	return &Server{store: st, bus: bus, hub: hub, reclaimer: r, log: log}
+// NewServer creates the API server. defaultTaskTimeout is applied to a job
+// whose spec does not set its own timeout_ms; zero disables the default.
+func NewServer(st store.Store, bus *events.Bus, hub *Hub, r Reclaimer, log *slog.Logger, defaultTaskTimeout time.Duration) *Server {
+	return &Server{store: st, bus: bus, hub: hub, reclaimer: r, log: log, defaultTaskTimeout: defaultTaskTimeout}
 }
 
 // ---------------------------------------------------------------------------
@@ -63,6 +69,11 @@ func (s *Server) SubmitJob(
 		poolID = domain.DefaultPoolID
 	}
 
+	timeout := s.defaultTaskTimeout
+	if ms := spec.GetTimeoutMs(); ms > 0 {
+		timeout = time.Duration(ms) * time.Millisecond
+	}
+
 	job := domain.Job{
 		JobID:       "job-" + uuid.NewString()[:8],
 		Name:        spec.GetName(),
@@ -75,6 +86,7 @@ func (s *Server) SubmitJob(
 		Request:     fromProtoRequest(spec.GetRequest()),
 		Mode:        fromProtoLeaseMode(spec.GetMode()),
 		Preemptible: spec.GetPreemptible(),
+		Timeout:     timeout,
 		State:       domain.JobPending,
 		SubmittedAt: time.Now(),
 	}
