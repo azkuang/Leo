@@ -562,7 +562,13 @@ func (a *Agent) startTask(ctx context.Context, stream *connect.BidiStreamForClie
 		timer := time.AfterFunc(spec.Timeout, func() {
 			rt.timedOut.Store(true)
 			a.log.Warn("task exceeded timeout", "lease", leaseID, "timeout", spec.Timeout)
-			a.stopTask(context.Background(), leaseID, 10*time.Second)
+			// Zero grace: a timeout is an enforced deadline, not a request
+			// the task can negotiate a graceful shutdown against. A
+			// multi-second grace here would let a task that is about to
+			// finish on its own slip past the deadline it just missed --
+			// exactly what happened in manual verification before this was
+			// changed from a 10s grace to 0.
+			a.stopTask(context.Background(), leaseID, 0)
 		})
 		defer timer.Stop()
 	}

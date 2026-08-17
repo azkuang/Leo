@@ -72,6 +72,7 @@ func (s *Store) Snapshot(ctx context.Context, queueLimit int) (*store.Snapshot, 
 		qt.Job.Mode = domain.LeaseMode(mode)
 		qt.Job.Command, qt.Job.Env, qt.Job.Assets, qt.Job.Request =
 			spec.Command, spec.Env, spec.Assets, spec.Request
+		qt.Job.Timeout = time.Duration(spec.TimeoutMs) * time.Millisecond
 		snap.Queued = append(snap.Queued, qt)
 	}
 	return snap, rows.Err()
