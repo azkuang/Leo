@@ -17,6 +17,10 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -378,8 +382,41 @@ func (n *Node) run(ctx context.Context, h agent.Handle, t *simTask, staging, dur
 			})
 			return
 		}
+		writeSimOutput(t.spec, dur)
 		n.finish(h, t, agent.Status{State: agent.ExecExited, ExitCode: 0, Progress: 1})
 	}
+}
+
+// writeSimOutput drops a small object into the task's writable output mount
+// (if any) before it finishes, so the agent's uploader has real bytes to ship
+// to the object store even on a simulated node. This is what lets the whole
+// data plane -- staging, mounting, uploading, manifesting -- be developed and
+// tested without a GPU: the simulator is not a test fixture, it exercises the
+// same seam a real container does.
+func writeSimOutput(spec agent.StartSpec, dur time.Duration) {
+	var outDir string
+	for _, m := range spec.Mounts {
+		if !m.ReadOnly && m.ContainerPath == agent.ContainerOutputDir {
+			outDir = m.HostPath
+			break
+		}
+	}
+	if outDir == "" {
+		return
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "task_index=%d\n", spec.Index)
+	fmt.Fprintf(&b, "attempt=%d\n", spec.Attempt)
+	fmt.Fprintf(&b, "duration_ms=%d\n", dur.Milliseconds())
+	keys := make([]string, 0, len(spec.Params))
+	for k := range spec.Params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&b, "param.%s=%s\n", k, spec.Params[k])
+	}
+	_ = os.WriteFile(filepath.Join(outDir, "output.txt"), []byte(b.String()), 0o644)
 }
 
 func (n *Node) finish(h agent.Handle, t *simTask, st agent.Status) {
@@ -434,12 +471,15 @@ func (n *Node) Status(_ context.Context, h agent.Handle) (agent.Status, error) {
 	return st, nil
 }
 
-// Forget drops finished bookkeeping so a long-lived agent does not grow without
-// bound.
-func (n *Node) Forget(h agent.Handle) {
+// Cleanup drops finished bookkeeping so a long-lived agent does not grow
+// without bound. It is the simulated half of the Executor.Cleanup contract;
+// unlike a real container there is nothing external to tear down, so this is
+// just the map delete that used to be named Forget and never called.
+func (n *Node) Cleanup(_ context.Context, h agent.Handle) error {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	delete(n.running, h)
+	return nil
 }
 
 func (n *Node) taskDuration(spec agent.StartSpec) time.Duration {

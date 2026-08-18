@@ -385,6 +385,10 @@ type Job struct {
 	Mode        LeaseMode       `json:"mode"`
 	Preemptible bool            `json:"preemptible"`
 
+	// Timeout is a hard wall-clock limit per task. Zero means no limit --
+	// nothing else stops a hung CUDA kernel from holding a slot forever.
+	Timeout time.Duration `json:"timeout,omitempty"`
+
 	State       JobState  `json:"state"`
 	SubmittedAt time.Time `json:"submitted_at"`
 }
@@ -412,6 +416,11 @@ type Task struct {
 	OutputPrefix string `json:"output_prefix,omitempty"`
 
 	Preemptions int `json:"preemptions"`
+
+	// ExitCode is nil until the task finishes -- "not yet finished" and
+	// "exited 0" are different facts, so this is a pointer rather than a
+	// plain int, mirrored by a nullable store column.
+	ExitCode *int `json:"exit_code,omitempty"`
 
 	StartedAt  time.Time `json:"started_at,omitempty"`
 	FinishedAt time.Time `json:"finished_at,omitempty"`

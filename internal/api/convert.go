@@ -332,7 +332,7 @@ func toProtoJob(j domain.Job, tasks []domain.Task) *orchv1.Job {
 }
 
 func toProtoTask(t domain.Task) *orchv1.Task {
-	return &orchv1.Task{
+	out := &orchv1.Task{
 		TaskId:          t.TaskID,
 		JobId:           t.JobID,
 		Index:           uint32(t.Index),
@@ -346,6 +346,11 @@ func toProtoTask(t domain.Task) *orchv1.Task {
 		FinishedAt:      ts(t.FinishedAt),
 		Preemptions:     uint32(t.Preemptions),
 	}
+	if t.ExitCode != nil {
+		ec := int32(*t.ExitCode)
+		out.ExitCode = &ec
+	}
+	return out
 }
 
 func toProtoLease(l domain.Lease) *orchv1.Lease {

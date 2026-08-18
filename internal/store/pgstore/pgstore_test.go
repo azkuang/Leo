@@ -674,6 +674,88 @@ func TestPolicyRoundTripsAndBumpsGeneration(t *testing.T) {
 	}
 }
 
+// exit_code flows into store.TaskStatus but was previously dropped by the
+// terminal UPDATE in ApplyTaskStatus. It must be persisted and readable back
+// off the task, and it must stay nil (not zero) for a task that has not
+// finished -- "not yet finished" and "exited 0" are different facts.
+func TestApplyTaskStatusPersistsExitCode(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+
+	nodeID := registerNode(t, st, "ws-01", 2, 48)
+	job, tasks := createJob(t, st, "default", 1)
+	slots := slotIDs(t, st, nodeID, 2)
+
+	if _, err := st.Commit(ctx, store.Plan{Placements: []store.Placement{{
+		LeaseID: "lease-a", TaskID: tasks[0].TaskID, JobID: job.JobID,
+		PoolID: "default", NodeID: nodeID, SlotIDs: slots[0:1],
+		Mode: domain.ModeBatch, TTL: time.Minute,
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, running, err := st.GetJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running[0].ExitCode != nil {
+		t.Fatalf("expected a nil exit code before the task finishes, got %v", *running[0].ExitCode)
+	}
+
+	if err := st.ApplyTaskStatus(ctx, store.TaskStatus{
+		LeaseID: "lease-a", TaskID: tasks[0].TaskID,
+		State: domain.TaskFailed, ExitCode: 13, Message: "boom", At: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, after, err := st.GetJob(ctx, job.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after[0].ExitCode == nil {
+		t.Fatal("expected a non-nil exit code after the task finished")
+	}
+	if *after[0].ExitCode != 13 {
+		t.Fatalf("exit code = %d, want 13", *after[0].ExitCode)
+	}
+}
+
+// Job.Timeout is stored inside the JSON spec blob rather than its own
+// column, which is exactly the kind of field that is easy to write and
+// forget to read back: CreateJob persisted it correctly from day one, but
+// Snapshot's queued-task decode (a second, independent read path) did not
+// carry it into domain.Job until this regression was caught by manual
+// end-to-end verification -- a task's timeout_ms was silently always zero
+// by the time the scheduler handed the job to the dispatcher, so no task
+// ever timed out regardless of what was submitted.
+func TestSnapshotCarriesJobTimeout(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+
+	job := domain.Job{
+		JobID: "job-timeout", PoolID: "default", ImageDigest: "sha256:test",
+		Mode: domain.ModeBatch, State: domain.JobPending, SubmittedAt: time.Now(),
+		Request: domain.ResourceRequest{Slots: 1},
+		Timeout: 90 * time.Second,
+	}
+	task := domain.Task{TaskID: "task-timeout-0", JobID: job.JobID, Index: 0, State: domain.TaskQueued}
+	if err := st.CreateJob(ctx, job, []domain.Task{task}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+
+	snap, err := st.Snapshot(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Queued) != 1 {
+		t.Fatalf("expected 1 queued task, got %d", len(snap.Queued))
+	}
+	if got := snap.Queued[0].Job.Timeout; got != 90*time.Second {
+		t.Fatalf("Snapshot dropped Job.Timeout: got %s, want 90s", got)
+	}
+}
+
 func TestMarkStaleNodesOffline(t *testing.T) {
 	ctx := context.Background()
 	st := newStore(t)

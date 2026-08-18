@@ -18,16 +18,22 @@ type jobSpec struct {
 	Env     map[string]string      `json:"env,omitempty"`
 	Assets  []domain.AssetRef      `json:"assets,omitempty"`
 	Request domain.ResourceRequest `json:"request"`
+	// TimeoutMs is domain.Job.Timeout in milliseconds -- time.Duration
+	// itself round-trips through JSON as a number of nanoseconds, which is
+	// correct but not worth a human glancing at the raw column having to
+	// convert, so this stores the same unit the wire type uses.
+	TimeoutMs int64 `json:"timeout_ms,omitempty"`
 }
 
 // CreateJob writes a job and its fan-out tasks in one transaction.
 func (s *Store) CreateJob(ctx context.Context, job domain.Job, tasks []domain.Task) error {
 	return s.tx(ctx, func(tx pgx.Tx) error {
 		spec, err := toJSON(jobSpec{
-			Command: job.Command,
-			Env:     job.Env,
-			Assets:  job.Assets,
-			Request: job.Request,
+			Command:   job.Command,
+			Env:       job.Env,
+			Assets:    job.Assets,
+			Request:   job.Request,
+			TimeoutMs: job.Timeout.Milliseconds(),
 		})
 		if err != nil {
 			return err
@@ -86,6 +92,7 @@ func scanJobs(rows pgx.Rows) ([]domain.Job, error) {
 			return nil, err
 		}
 		j.Command, j.Env, j.Assets, j.Request = spec.Command, spec.Env, spec.Assets, spec.Request
+		j.Timeout = time.Duration(spec.TimeoutMs) * time.Millisecond
 		out = append(out, j)
 	}
 	return out, rows.Err()
@@ -128,7 +135,7 @@ func (s *Store) ListTasks(ctx context.Context, jobID string) ([]domain.Task, err
 	rows, err := s.pool.Query(ctx, `
 		SELECT task_id, job_id, idx, params, attempt, state,
 		       COALESCE(assigned_lease_id, ''), COALESCE(node_id, ''),
-		       output_prefix, preemptions, message, started_at, finished_at
+		       output_prefix, preemptions, message, started_at, finished_at, exit_code
 		FROM tasks WHERE job_id = $1 ORDER BY idx`, jobID)
 	if err != nil {
 		return nil, err
@@ -146,7 +153,7 @@ func (s *Store) ListTasks(ctx context.Context, jobID string) ([]domain.Task, err
 		)
 		err := rows.Scan(&t.TaskID, &t.JobID, &t.Index, &paramsRaw, &t.Attempt, &state,
 			&t.AssignedLeaseID, &t.NodeID, &t.OutputPrefix, &t.Preemptions, &t.Message,
-			&started, &finished)
+			&started, &finished, &t.ExitCode)
 		if err != nil {
 			return nil, err
 		}
@@ -240,9 +247,9 @@ func (s *Store) ApplyTaskStatus(ctx context.Context, st store.TaskStatus) error 
 
 		case domain.TaskDone, domain.TaskFailed:
 			_, err = tx.Exec(ctx, `
-				UPDATE tasks SET state = $2, message = $3, output_prefix = $4, finished_at = $5
+				UPDATE tasks SET state = $2, message = $3, output_prefix = $4, finished_at = $5, exit_code = $7
 				WHERE task_id = $1 AND assigned_lease_id = $6`,
-				st.TaskID, string(st.State), st.Message, st.OutputPrefix, st.At, st.LeaseID)
+				st.TaskID, string(st.State), st.Message, st.OutputPrefix, st.At, st.LeaseID, st.ExitCode)
 			if err != nil {
 				return err
 			}

@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -31,17 +32,41 @@ import (
 
 func main() {
 	var (
-		dsn        = flag.String("dsn", envOr("ORCH_DSN", "postgres://localhost:5432/orch?sslmode=disable"), "Postgres connection string")
-		listen     = flag.String("listen", envOr("ORCH_LISTEN", ":9443"), "listen address")
-		interval   = flag.Duration("schedule-interval", 500*time.Millisecond, "placement loop interval")
-		leaseTTL   = flag.Duration("lease-ttl", 30*time.Second, "lease TTL; agents renew on each heartbeat")
-		hbTimeout  = flag.Duration("heartbeat-timeout", 15*time.Second, "mark a node offline after this long without a heartbeat")
-		hbInterval = flag.Duration("heartbeat-interval", 2*time.Second, "interval agents are told to heartbeat at")
-		logLevel   = flag.String("log-level", envOr("ORCH_LOG_LEVEL", "info"), "debug, info, warn or error")
+		dsn         = flag.String("dsn", envOr("ORCH_DSN", "postgres://localhost:5432/orch?sslmode=disable"), "Postgres connection string")
+		listen      = flag.String("listen", envOr("ORCH_LISTEN", ":9443"), "listen address")
+		interval    = flag.Duration("schedule-interval", 500*time.Millisecond, "placement loop interval")
+		leaseTTL    = flag.Duration("lease-ttl", 30*time.Second, "lease TTL; agents renew on each heartbeat")
+		hbTimeout   = flag.Duration("heartbeat-timeout", 15*time.Second, "mark a node offline after this long without a heartbeat")
+		hbInterval  = flag.Duration("heartbeat-interval", 2*time.Second, "interval agents are told to heartbeat at")
+		logLevel    = flag.String("log-level", envOr("ORCH_LOG_LEVEL", "info"), "debug, info, warn or error")
+		taskTimeout = flag.Duration("task-timeout", 0, "default hard wall-clock limit per task, applied when a job does not set its own; 0 = none")
+
+		s3Endpoint    = flag.String("s3-endpoint", envOr("ORCH_S3_ENDPOINT", ""), "object store endpoint (host:port); unset disables STS credential minting")
+		s3STSEndpoint = flag.String("s3-sts-endpoint", envOr("ORCH_S3_STS_ENDPOINT", ""), "STS AssumeRole endpoint; defaults to s3-endpoint (MinIO serves both)")
+		s3Bucket      = flag.String("s3-bucket", envOr("ORCH_S3_BUCKET", ""), "object store bucket")
+		s3AccessKey   = flag.String("s3-access-key", envOr("ORCH_S3_ACCESS_KEY", ""), "broad admin credential used only to call AssumeRole; never sent to an agent")
+		s3SecretKey   = flag.String("s3-secret-key", envOr("ORCH_S3_SECRET_KEY", ""), "broad admin credential used only to call AssumeRole; never sent to an agent")
+		s3UseSSL      = flag.Bool("s3-use-ssl", envBoolOr("ORCH_S3_USE_SSL", false), "use TLS against the object store")
 	)
 	flag.Parse()
 
 	log := newLogger(*logLevel)
+
+	var s3 *api.S3Config
+	if *s3Endpoint != "" && *s3Bucket != "" {
+		stsEndpoint := *s3STSEndpoint
+		if stsEndpoint == "" {
+			stsEndpoint = *s3Endpoint
+		}
+		s3 = &api.S3Config{
+			Endpoint:    *s3Endpoint,
+			STSEndpoint: stsEndpoint,
+			Bucket:      *s3Bucket,
+			AccessKey:   *s3AccessKey,
+			SecretKey:   *s3SecretKey,
+			UseSSL:      *s3UseSSL,
+		}
+	}
 
 	if err := run(runConfig{
 		DSN:               *dsn,
@@ -50,6 +75,8 @@ func main() {
 		LeaseTTL:          *leaseTTL,
 		HeartbeatTimeout:  *hbTimeout,
 		HeartbeatInterval: *hbInterval,
+		TaskTimeout:       *taskTimeout,
+		S3:                s3,
 		Log:               log,
 	}); err != nil {
 		log.Error("orchd exited", "err", err)
@@ -64,6 +91,8 @@ type runConfig struct {
 	LeaseTTL          time.Duration
 	HeartbeatTimeout  time.Duration
 	HeartbeatInterval time.Duration
+	TaskTimeout       time.Duration
+	S3                *api.S3Config
 	Log               *slog.Logger
 }
 
@@ -81,7 +110,10 @@ func run(cfg runConfig) error {
 	cfg.Log.Info("connected to postgres, schema up to date")
 
 	bus := events.NewBus()
-	hub := api.NewHub(st, bus, cfg.Log.With("component", "hub"), cfg.HeartbeatInterval)
+	hub := api.NewHub(st, bus, cfg.Log.With("component", "hub"), cfg.HeartbeatInterval, cfg.S3)
+	if cfg.S3 == nil {
+		cfg.Log.Info("no ORCH_S3_* configuration found; agents will not receive per-lease upload credentials")
+	}
 
 	sched := scheduler.New(st, bus, cfg.Log.With("component", "scheduler"), scheduler.Config{
 		Interval:         cfg.Interval,
@@ -91,7 +123,7 @@ func run(cfg runConfig) error {
 	})
 	sched.SetDispatcher(hub)
 
-	srv := api.NewServer(st, bus, hub, sched, cfg.Log.With("component", "api"))
+	srv := api.NewServer(st, bus, hub, sched, cfg.Log.With("component", "api"), cfg.TaskTimeout)
 
 	mux := http.NewServeMux()
 	mux.Handle(orchv1connect.NewAgentServiceHandler(hub))
@@ -169,4 +201,16 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+func envBoolOr(key string, fallback bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return fallback
+	}
+	return b
 }

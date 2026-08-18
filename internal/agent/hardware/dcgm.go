@@ -42,15 +42,35 @@ var throttleNames = []struct {
 	{throttleGPUIdle, "gpu_idle"},
 }
 
-// dcgmDeviceFields are polled once per sample in addition to the summary
-// GetDeviceStatus call, which does not cover throttle reasons, XID errors or
-// row-remap counts.
-var dcgmDeviceFields = []dcgm.Short{
+// dcgmFields are every field the health sample needs, watched once as a
+// single persistent field group rather than the summary GetDeviceStatus call
+// this used to build on. GetDeviceStatus does no blank-sentinel filtering of
+// its own, so on GeForce-class cards (no ECC, no PCIe replay counting) it
+// surfaced DCGM's "not supported" sentinel
+// (9223372036854775792) as if it were a real reading. Reading every field
+// through this one path lets decodeFieldValues apply the same "blank means
+// unsupported, not zero" rule everywhere.
+var dcgmFields = []dcgm.Short{
+	dcgm.DCGM_FI_DEV_GPU_UTIL,
 	dcgm.DCGM_FI_DEV_FB_FREE,
+	dcgm.DCGM_FI_DEV_GPU_TEMP,
+	dcgm.DCGM_FI_DEV_POWER_USAGE,
 	dcgm.DCGM_FI_DEV_CLOCK_THROTTLE_REASONS,
 	dcgm.DCGM_FI_DEV_XID_ERROR,
 	dcgm.DCGM_FI_DEV_ROW_REMAP_UNCORRECTABLE_TOTAL,
+	dcgm.DCGM_FI_DEV_PCIE_REPLAY_COUNTER,
+	dcgm.DCGM_FI_DEV_ECC_DBE_VOL_TOTAL,
 }
+
+// Watch parameters for the persistent field group. The 1s update frequency
+// matches Stream's own sample cadence; maxKeepAge/maxKeepSamples are small
+// because only the latest value is ever read (EntitiesGetLatestValues), not
+// a history.
+const (
+	dcgmUpdateFreqUsec = 1_000_000
+	dcgmMaxKeepAgeSec  = 30.0
+	dcgmMaxKeepSamples = 5
+)
 
 // DCGMSource streams fast-path GPU health telemetry via DCGM.
 type DCGMSource struct {
@@ -66,11 +86,20 @@ type DCGMSource struct {
 	// the same NVML index, so a health sample can report ECCSupported
 	// without a second NVML round-trip per tick.
 	eccPresent map[int]bool
+
+	// fieldGroup/watchGroup/entities are created once here rather than
+	// per-sample: DCGM only populates fields that are actively being
+	// watched, and creating the watch is not free, so it belongs at startup,
+	// not on every tick.
+	fieldGroup dcgm.FieldHandle
+	watchGroup dcgm.GroupHandle
+	entities   []dcgm.GroupEntityPair
 }
 
 // newDCGMSource starts DCGM (embedded host engine, one per node -- the
-// simplest mode for a per-machine agent) and builds the GPU-ID-to-device-index
-// mapping.
+// simplest mode for a per-machine agent), builds the GPU-ID-to-device-index
+// mapping, and establishes one persistent watch over dcgmFields for every
+// GPU on the node.
 func newDCGMSource(log *slog.Logger) (*DCGMSource, error) {
 	if _, err := dcgm.Init(dcgm.Embedded); err != nil {
 		return nil, fmt.Errorf("start embedded host engine: %w", err)
@@ -82,7 +111,68 @@ func newDCGMSource(log *slog.Logger) (*DCGMSource, error) {
 		return nil, err
 	}
 
-	return &DCGMSource{log: log, gpuIndex: gpuIndex, eccPresent: eccPresent}, nil
+	fieldGroup, err := dcgm.FieldGroupCreate("orch-health", dcgmFields)
+	if err != nil {
+		dcgm.Shutdown()
+		return nil, fmt.Errorf("create field group: %w", err)
+	}
+
+	watchGroup, err := dcgm.CreateGroup("orch-health")
+	if err != nil {
+		_ = dcgm.FieldGroupDestroy(fieldGroup)
+		dcgm.Shutdown()
+		return nil, fmt.Errorf("create watch group: %w", err)
+	}
+
+	entities := make([]dcgm.GroupEntityPair, 0, len(gpuIndex))
+	for gpuID := range gpuIndex {
+		if err := dcgm.AddEntityToGroup(watchGroup, dcgm.FE_GPU, gpuID); err != nil {
+			_ = dcgm.DestroyGroup(watchGroup)
+			_ = dcgm.FieldGroupDestroy(fieldGroup)
+			dcgm.Shutdown()
+			return nil, fmt.Errorf("add gpu %d to watch group: %w", gpuID, err)
+		}
+		entities = append(entities, dcgm.GroupEntityPair{EntityGroupId: dcgm.FE_GPU, EntityId: gpuID})
+	}
+
+	// This is the fix: the previous version of this code called
+	// GetLatestValuesForFields without ever watching the fields it read, so
+	// every value came back as DCGM's "blank" sentinel, decoded as zero --
+	// Throttled()/Degraded() could never fire on real hardware regardless of
+	// the card's actual state.
+	if err := dcgm.WatchFieldsWithGroupEx(
+		fieldGroup, watchGroup, dcgmUpdateFreqUsec, dcgmMaxKeepAgeSec, dcgmMaxKeepSamples,
+	); err != nil {
+		_ = dcgm.DestroyGroup(watchGroup)
+		_ = dcgm.FieldGroupDestroy(fieldGroup)
+		dcgm.Shutdown()
+		return nil, fmt.Errorf("watch fields: %w", err)
+	}
+
+	return &DCGMSource{
+		log:        log,
+		gpuIndex:   gpuIndex,
+		eccPresent: eccPresent,
+		fieldGroup: fieldGroup,
+		watchGroup: watchGroup,
+		entities:   entities,
+	}, nil
+}
+
+// Close stops the field watch and shuts down the embedded DCGM host engine.
+func (s *DCGMSource) Close() error {
+	var errs []error
+	if err := dcgm.UnwatchFields(s.fieldGroup, s.watchGroup); err != nil {
+		errs = append(errs, fmt.Errorf("unwatch fields: %w", err))
+	}
+	if err := dcgm.DestroyGroup(s.watchGroup); err != nil {
+		errs = append(errs, fmt.Errorf("destroy watch group: %w", err))
+	}
+	if err := dcgm.FieldGroupDestroy(s.fieldGroup); err != nil {
+		errs = append(errs, fmt.Errorf("destroy field group: %w", err))
+	}
+	dcgm.Shutdown()
+	return joinErrs(errs)
 }
 
 // reconcileDeviceIndices matches each DCGM-reported GPU to the NVML device
@@ -162,64 +252,109 @@ func (s *DCGMSource) Stream(ctx context.Context) (<-chan []domain.HealthSample, 
 	return ch, nil
 }
 
+// sample reads every watched field for every GPU in one round trip
+// (UpdateAllFields + EntitiesGetLatestValues), rather than one DCGM call per
+// device -- which is also what removes the hidden per-second field-group
+// churn that lived inside the old GetDeviceStatus call.
 func (s *DCGMSource) sample() ([]domain.HealthSample, error) {
+	if err := dcgm.UpdateAllFields(); err != nil {
+		return nil, fmt.Errorf("update fields: %w", err)
+	}
+	values, err := dcgm.EntitiesGetLatestValues(s.entities, dcgmFields, 0)
+	if err != nil {
+		return nil, fmt.Errorf("get latest field values: %w", err)
+	}
+
+	byGPU := make(map[uint][]dcgm.FieldValue_v2, len(s.gpuIndex))
+	for _, v := range values {
+		byGPU[v.EntityID] = append(byGPU[v.EntityID], v)
+	}
+
 	now := time.Now()
 	out := make([]domain.HealthSample, 0, len(s.gpuIndex))
-
 	for gpuID, index := range s.gpuIndex {
-		status, err := dcgm.GetDeviceStatus(gpuID)
-		if err != nil {
-			return nil, fmt.Errorf("gpu %d: get device status: %w", gpuID, err)
-		}
-
-		values, err := dcgm.GetLatestValuesForFields(gpuID, dcgmDeviceFields)
-		if err != nil {
-			return nil, fmt.Errorf("gpu %d: get latest field values: %w", gpuID, err)
-		}
-		freeVRAMGB, throttleBits, xid, rowRemap := decodeFields(values)
-
+		d := decodeFieldValues(byGPU[gpuID])
 		sample := domain.HealthSample{
 			DeviceIndex:       index,
-			Utilization:       float64(status.Utilization.GPU) / 100,
-			FreeVRAMGB:        freeVRAMGB,
-			TemperatureC:      float64(status.Temperature),
-			PowerW:            status.Power,
-			ThrottleReasons:   decodeThrottleReasons(throttleBits),
-			PCIeReplayCount:   uint64(status.PCI.Throughput.Replays),
+			Utilization:       d.utilization,
+			FreeVRAMGB:        d.freeVRAMGB,
+			TemperatureC:      d.temperatureC,
+			PowerW:            d.powerW,
+			ThrottleReasons:   decodeThrottleReasons(d.throttleBits),
+			PCIeReplayCount:   d.pcieReplayCount,
 			ECCSupported:      s.eccPresent[index],
-			ECCVolatileErrors: uint64(status.Memory.ECCErrors.DoubleBit),
-			RowRemapPending:   rowRemap,
+			ECCVolatileErrors: d.eccVolatileErrors,
+			RowRemapPending:   d.rowRemapPending,
 			SampledAt:         now,
 		}
-		if xid > 0 {
-			sample.XIDErrors = []int{xid}
+		if d.xid > 0 {
+			sample.XIDErrors = []int{d.xid}
 		}
 		out = append(out, sample)
 	}
 	return out, nil
 }
 
-// decodeFields pulls the values requested via dcgmDeviceFields out in order,
-// treating DCGM's "blank" (no data / not supported) sentinels as zero rather
-// than as a huge sentinel integer.
-func decodeFields(values []dcgm.FieldValue_v1) (freeVRAMGB int, throttleBits uint64, xid int, rowRemap uint64) {
+// decodedFields is the pure-Go result of decodeFieldValues, kept separate
+// from domain.HealthSample so the decode step is unit-testable without
+// constructing a full sample.
+type decodedFields struct {
+	utilization       float64
+	freeVRAMGB        int
+	temperatureC      float64
+	powerW            float64
+	throttleBits      uint64
+	xid               int
+	rowRemapPending   uint64
+	pcieReplayCount   uint64
+	eccVolatileErrors uint64
+}
+
+// decodeFieldValues turns one GPU's watched fields into the values a health
+// sample needs, treating DCGM's blank ("no data" / "not supported")
+// sentinels as unsupported -- left at the zero value -- rather than as a
+// real reading. Conflating "0 replays" with "this card has no PCIe replay
+// counter" is exactly the bug this replaces: on a GeForce-class card the old
+// GetDeviceStatus path surfaced the raw sentinel
+// (9223372036854775792) as if it were a real count.
+func decodeFieldValues(values []dcgm.FieldValue_v2) decodedFields {
+	var d decodedFields
 	for _, v := range values {
-		val := v.Int64()
-		if val >= dcgm.DCGM_FT_INT64_BLANK {
+		if v.FieldType == dcgm.DCGM_FT_DOUBLE {
+			f := v.Float64()
+			if f >= dcgm.DCGM_FT_FP64_BLANK {
+				continue
+			}
+			if v.FieldID == dcgm.DCGM_FI_DEV_POWER_USAGE {
+				d.powerW = f
+			}
+			continue
+		}
+
+		i := v.Int64()
+		if i >= dcgm.DCGM_FT_INT64_BLANK {
 			continue
 		}
 		switch v.FieldID {
+		case dcgm.DCGM_FI_DEV_GPU_UTIL:
+			d.utilization = float64(i) / 100
 		case dcgm.DCGM_FI_DEV_FB_FREE:
-			freeVRAMGB = int(val / 1024) // MB -> GB
+			d.freeVRAMGB = int(i / 1024) // MB -> GB
+		case dcgm.DCGM_FI_DEV_GPU_TEMP:
+			d.temperatureC = float64(i)
 		case dcgm.DCGM_FI_DEV_CLOCK_THROTTLE_REASONS:
-			throttleBits = uint64(val)
+			d.throttleBits = uint64(i)
 		case dcgm.DCGM_FI_DEV_XID_ERROR:
-			xid = int(val)
+			d.xid = int(i)
 		case dcgm.DCGM_FI_DEV_ROW_REMAP_UNCORRECTABLE_TOTAL:
-			rowRemap = uint64(val)
+			d.rowRemapPending = uint64(i)
+		case dcgm.DCGM_FI_DEV_PCIE_REPLAY_COUNTER:
+			d.pcieReplayCount = uint64(i)
+		case dcgm.DCGM_FI_DEV_ECC_DBE_VOL_TOTAL:
+			d.eccVolatileErrors = uint64(i)
 		}
 	}
-	return freeVRAMGB, throttleBits, xid, rowRemap
+	return d
 }
 
 func decodeThrottleReasons(bits uint64) []string {

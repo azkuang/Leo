@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"connectrpc.com/connect"
 
@@ -56,6 +57,11 @@ func cmdSubmit(ctx context.Context, c orchv1connect.OrchServiceClient, args []st
 		return errors.New("--image is required")
 	}
 
+	commandArgs, err := shellSplit(*command)
+	if err != nil {
+		return fmt.Errorf("--command: %w", err)
+	}
+
 	mode := orchv1.LeaseMode_LEASE_MODE_BATCH
 	if *service {
 		mode = orchv1.LeaseMode_LEASE_MODE_SERVICE
@@ -91,7 +97,7 @@ func cmdSubmit(ctx context.Context, c orchv1connect.OrchServiceClient, args []st
 			Owner:       *owner,
 			PoolId:      *pool,
 			ImageDigest: *image,
-			Command:     splitNonEmpty(*command, " "),
+			Command:     commandArgs,
 			Env:         parsePairs(*env),
 			Mode:        mode,
 			Preemptible: *preemptible,
@@ -132,9 +138,66 @@ func parsePairs(s string) map[string]string {
 	return out
 }
 
-func splitNonEmpty(s, sep string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
+// shellSplit tokenizes a command string the way a POSIX shell would split
+// unquoted words: whitespace separates tokens, single quotes are literal,
+// double quotes allow backslash-escaping \" and \\, and a bare backslash
+// escapes the next character outside quotes. This replaces a naive
+// strings.Split(s, " "), which could not express any argument containing a
+// space at all (a quoted path, a multi-word title).
+func shellSplit(s string) ([]string, error) {
+	var (
+		tokens             []string
+		cur                strings.Builder
+		hasToken           bool
+		inSingle, inDouble bool
+	)
+
+	runes := []rune(s)
+	for i := 0; i < len(runes); i++ {
+		r := runes[i]
+		switch {
+		case inSingle:
+			if r == '\'' {
+				inSingle = false
+			} else {
+				cur.WriteRune(r)
+			}
+		case inDouble:
+			switch {
+			case r == '"':
+				inDouble = false
+			case r == '\\' && i+1 < len(runes) && (runes[i+1] == '"' || runes[i+1] == '\\'):
+				i++
+				cur.WriteRune(runes[i])
+			default:
+				cur.WriteRune(r)
+			}
+		case r == '\'':
+			inSingle = true
+			hasToken = true
+		case r == '"':
+			inDouble = true
+			hasToken = true
+		case r == '\\' && i+1 < len(runes):
+			i++
+			cur.WriteRune(runes[i])
+			hasToken = true
+		case unicode.IsSpace(r):
+			if hasToken {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+				hasToken = false
+			}
+		default:
+			cur.WriteRune(r)
+			hasToken = true
+		}
 	}
-	return strings.Split(s, sep)
+	if inSingle || inDouble {
+		return nil, errors.New("unterminated quote")
+	}
+	if hasToken {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens, nil
 }

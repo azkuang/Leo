@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/minio/minio-go/v7/pkg/credentials"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	orchv1 "github.com/alexk/orch/gen/orch/v1"
 	"github.com/alexk/orch/internal/domain"
@@ -28,8 +30,36 @@ type Hub struct {
 
 	heartbeatInterval time.Duration
 
+	// s3 configures STS credential minting for per-lease object store
+	// access. Nil disables minting entirely -- Assignment.Creds is left
+	// unset and the agent falls back to its own static configuration,
+	// exactly the pre-data-plane behaviour.
+	s3 *S3Config
+
 	mu    sync.RWMutex
 	conns map[string]*conn
+}
+
+// S3Config is the control plane's half of the object store wiring: the
+// broad (admin) credential used only to call STS AssumeRole, and the facts
+// handed down to agents so they can build their own per-lease client from
+// the temporary credentials that call returns.
+type S3Config struct {
+	// Endpoint and UseSSL are the data-plane facts handed to agents inside
+	// ObjectCredentials -- where to actually PUT objects.
+	Endpoint string
+	UseSSL   bool
+	Bucket   string
+	// STSEndpoint is where AssumeRole is called. MinIO serves STS on the
+	// same address as its S3 API by default, so this is usually equal to
+	// Endpoint, but is configurable separately since that is not guaranteed
+	// for every S3-compatible deployment.
+	STSEndpoint string
+	// AccessKey/SecretKey are the control plane's own broad credential.
+	// They are never sent to an agent -- only the narrow, expiring
+	// credentials AssumeRole returns are.
+	AccessKey string
+	SecretKey string
 }
 
 type conn struct {
@@ -45,13 +75,15 @@ func (c *conn) close() {
 	c.closeOnce.Do(func() { close(c.closed) })
 }
 
-// NewHub creates an agent hub.
-func NewHub(st store.Store, bus *events.Bus, log *slog.Logger, heartbeatInterval time.Duration) *Hub {
+// NewHub creates an agent hub. s3 may be nil, disabling STS credential
+// minting -- see S3Config.
+func NewHub(st store.Store, bus *events.Bus, log *slog.Logger, heartbeatInterval time.Duration, s3 *S3Config) *Hub {
 	return &Hub{
 		store:             st,
 		bus:               bus,
 		log:               log,
 		heartbeatInterval: heartbeatInterval,
+		s3:                s3,
 		conns:             map[string]*conn{},
 	}
 }
@@ -326,13 +358,75 @@ func (h *Hub) Assign(nodeID string, p store.Placement, task domain.Task, job dom
 			Assets:       toProtoAssets(job.Assets),
 			OutputPrefix: p.OutputPrefix,
 			Attempt:      uint32(p.Attempt),
+			Params:       task.Params,
+			TimeoutMs:    uint64(job.Timeout.Milliseconds()),
 		},
 	}
+	as.Creds = h.mintCreds(p.OutputPrefix, p.TTL)
 
 	if !h.trySend(c, &orchv1.ControlMessage{Msg: &orchv1.ControlMessage_Assign{Assign: as}}) {
 		return fmt.Errorf("could not deliver assignment to %s", nodeID)
 	}
 	return nil
+}
+
+// mintCreds requests a temporary, write-only credential from the object
+// store's STS endpoint, scoped to this lease's output prefix and expiring
+// with the lease TTL. Returns nil (no error) whenever minting is not
+// possible or not configured -- the agent falls back to its own static
+// configuration in that case, which is the deliberate, non-fatal default
+// for a deployment that has not wired up STS.
+func (h *Hub) mintCreds(outputPrefix string, ttl time.Duration) *orchv1.ObjectCredentials {
+	if h.s3 == nil {
+		return nil
+	}
+
+	seconds := int(ttl.Seconds())
+	if seconds < 900 {
+		// AWS STS's own floor; MinIO enforces the same minimum. A lease TTL
+		// shorter than this is refreshed by renewal well before it matters.
+		seconds = 900
+	}
+
+	scheme := "http://"
+	if h.s3.UseSSL {
+		scheme = "https://"
+	}
+	stsCreds, err := credentials.NewSTSAssumeRole(scheme+h.s3.STSEndpoint, credentials.STSAssumeRoleOptions{
+		AccessKey:       h.s3.AccessKey,
+		SecretKey:       h.s3.SecretKey,
+		Policy:          stsOutputPolicy(h.s3.Bucket, outputPrefix),
+		DurationSeconds: seconds,
+	})
+	if err != nil {
+		h.log.Warn("sts assume role setup failed, agent will use its own static credentials", "err", err)
+		return nil
+	}
+	val, err := stsCreds.Get()
+	if err != nil {
+		h.log.Warn("sts assume role call failed, agent will use its own static credentials", "err", err)
+		return nil
+	}
+
+	return &orchv1.ObjectCredentials{
+		AccessKeyId:     val.AccessKeyID,
+		SecretAccessKey: val.SecretAccessKey,
+		SessionToken:    val.SessionToken,
+		Endpoint:        h.s3.Endpoint,
+		Bucket:          h.s3.Bucket,
+		UseSsl:          h.s3.UseSSL,
+		ExpiresAt:       timestamppb.New(val.Expiration),
+	}
+}
+
+// stsOutputPolicy scopes the minted credential to
+// arn:aws:s3:::<bucket>/<outputPrefix>*, action s3:PutObject only. This is
+// what upgrades "a zombie from a preempted attempt writes where nobody
+// reads" from a naming convention into an enforced fact: the credential
+// cannot write anywhere else even if the zombie tries.
+func stsOutputPolicy(bucket, outputPrefix string) string {
+	return fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::%s/%s*"]}]}`,
+		bucket, outputPrefix)
 }
 
 // Preempt tells a node to stop running a lease.
