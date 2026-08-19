@@ -16,7 +16,6 @@ flowchart TB
         UI["Browser UI<br/>(React, embedded in orchd)"]
         CLI["orchctl<br/>(CLI client)"]
     end
-
     subgraph ControlPlane["Control plane — orchd (single process)"]
         API["internal/api<br/>ConnectRPC handlers<br/>(OrchService)"]
         HUB["internal/api.Hub<br/>agent connections<br/>(AgentService, bidi stream)"]
@@ -25,15 +24,12 @@ flowchart TB
         SSE["/events (SSE)"]
         STORE["internal/store/pgstore<br/>Postgres via pgx"]
     end
-
     PG[("PostgreSQL 16<br/>scheduling state + job history")]
     OBJ[("MinIO / S3<br/>object store — payloads only")]
-
     subgraph Agents["Node agents — orchd-agent, one per machine"]
         A1["Agent (real)<br/>NVML · DCGM · containerd"]
         A2["Agent (simulated)<br/>sim.Node"]
     end
-
     UI -- "ConnectRPC (HTTP/JSON or gRPC)" --> API
     UI -- "SSE stream" --> SSE
     CLI -- "ConnectRPC" --> API
@@ -44,14 +40,11 @@ flowchart TB
     SCHED -- "Snapshot() / Commit()" --> STORE
     SCHED -- "Assign() / Preempt() via Dispatcher iface" --> HUB
     STORE --> PG
-
     HUB -- "bidi gRPC stream<br/>heartbeat up / assignment down" --> A1
     HUB -- "bidi gRPC stream" --> A2
-
     A1 -- "stage/fetch assets, write results" --> OBJ
     A2 -. "simulated, no real bytes" .-> OBJ
     UI -. "uploads/downloads assets directly" .-> OBJ
-
     style ControlPlane fill:#1f2937,color:#fff,stroke:#374151
     style Agents fill:#1f2937,color:#fff,stroke:#374151
     style Client fill:#1f2937,color:#fff,stroke:#374151
