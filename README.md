@@ -12,7 +12,8 @@ rendering, LLMs, or CAD.
 
 ---
 
-# System Architecture
+## System Architecture
+
 ```mermaid
 flowchart TB
     subgraph Client["Client side"]
@@ -61,3 +62,34 @@ flowchart TB
 ```
 
 ---
+
+## Deployment topology
+
+```mermaid
+flowchart TB
+    subgraph DockerHost["Docker Compose (control plane only)"]
+        PG[("postgres:16-alpine")]
+        MinIO[("minio/minio")]
+        Orchd["orchd container<br/>:9443"]
+        Orchd --> PG
+    end
+
+    subgraph Machine1["GPU workstation (systemd unit)"]
+        Agent1["orchd-agent<br/>--containerd-socket /run/containerd/containerd.sock"]
+        Containerd1["containerd + nvidia-container-toolkit"]
+        Agent1 --> Containerd1
+    end
+
+    subgraph Machine2["GPU workstation (systemd unit)"]
+        Agent2["orchd-agent"]
+        Containerd2["containerd"]
+        Agent2 --> Containerd2
+    end
+
+    Browser["Team members' browsers"] -->|":9443"| Orchd
+    Agent1 -->|"gRPC bidi (h2c)"| Orchd
+    Agent2 -->|"gRPC bidi (h2c)"| Orchd
+    Agent1 -.->|"stage/upload assets"| MinIO
+    Agent2 -.->|"stage/upload assets"| MinIO
+    Browser -.->|"asset upload/download"| MinIO
+```

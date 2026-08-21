@@ -72,8 +72,15 @@ services:
       # "Object storage" section. AccessKey/SecretKey here are the broad
       # admin credential used only to call AssumeRole; agents only ever see
       # the narrow, expiring credential that call returns.
-      ORCH_S3_ENDPOINT: minio:9000
-      ORCH_S3_STS_ENDPOINT: minio:9000
+      #
+      # This must be reachable from every agent node, not just from other
+      # containers on this compose network -- "minio" only resolves inside
+      # Docker's embedded DNS. Bare-metal agents (leo-test, leo-test2, ...)
+      # resolve it via the host's real LAN address instead. minio/postgres
+      # still address each other as "minio"/"postgres" fine; only the value
+      # handed out to agents via mintCreds needs to be externally reachable.
+      ORCH_S3_ENDPOINT: 10.37.173.128:9000
+      ORCH_S3_STS_ENDPOINT: 10.37.173.128:9000
       ORCH_S3_BUCKET: orch
       ORCH_S3_ACCESS_KEY: orch
       ORCH_S3_SECRET_KEY: orchorch

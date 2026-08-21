@@ -31,7 +31,7 @@ pools:
   # not yet seen by the control plane is reported, not treated as an error.
   - name: real-canary
     nodes: []
-    lendable: false
+    lendable: true
     borrow_ceiling: 0
 
 policy:
